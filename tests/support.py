@@ -14,7 +14,9 @@ if FEED not in sys.path:
     sys.path.insert(0, FEED)
 
 os.environ["ADDONSYNC_STATE_DIR"] = tempfile.mkdtemp(prefix="addonsync-ci-")
-os.environ.pop("ADDONSYNC_CONFIG", None)
+# Never the developer's own feed/config.json: a path that does not exist.
+os.environ["ADDONSYNC_CONFIG"] = os.path.join(
+    os.environ["ADDONSYNC_STATE_DIR"], "no-config.json")
 # A neutral feed, so the tests never depend on one real addon or forum.
 os.environ["ADDONSYNC_PRESET"] = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "preset.json")

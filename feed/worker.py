@@ -189,10 +189,35 @@ def log(msg):
     print(line, flush=True)
 
 
+def _is_unset(value):
+    return value is None or value == "" or value == []
+
+
+def merge_settings(base, overrides):
+    """Apply config.json on top of defaults + preset.
+
+    Empty values ("", [], null) mean "not set" and keep what is underneath, so
+    a verbatim copy of config.example.json does not blank the preset's
+    thread_url. Dict values merge one level deep, like the preset merge, so a
+    config "downloader" block changes only the keys it sets.
+    """
+    out = dict(base)
+    if not isinstance(overrides, dict):
+        return out
+    for key, value in overrides.items():
+        if _is_unset(value):
+            continue
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            merged = dict(out[key])
+            merged.update({k: v for k, v in value.items() if not _is_unset(v)})
+            out[key] = merged
+        else:
+            out[key] = value
+    return out
+
+
 def config():
-    cfg = dict(DEFAULTS)
-    cfg.update(read_json(CONF, {}))
-    return cfg
+    return merge_settings(DEFAULTS, read_json(CONF, {}))
 
 
 def state():
@@ -557,6 +582,8 @@ def find_addon_root(dest, expected=""):
                 break
     if not candidates:
         return None
+    # A flat archive (toc at the root) yields dest itself as a candidate;
+    # callers name it with addon_name_for(), never by dest's temp name.
     if expected:
         for c in candidates:
             if os.path.basename(c).lower() == expected.lower():
@@ -568,6 +595,53 @@ def find_addon_root(dest, expected=""):
         if any(base.startswith(n) for n in known):
             return c
     return candidates[0]
+
+
+def _toc_stems(folder):
+    try:
+        return sorted(os.path.splitext(f)[0] for f in os.listdir(folder)
+                      if f.lower().endswith(".toc"))
+    except OSError:
+        return []
+
+
+def addon_name_for(root, dest, expected=""):
+    """The addon folder name to publish `root` under.
+
+    Normally the folder's own name. When the archive is flat (the .toc sits
+    at the archive root), `root` is the extraction directory, whose name is a
+    random temp name; use the expected addon name when its .toc is there, else
+    the shortest .toc stem (DemoAddon.toc beats DemoAddon_Mainline.toc).
+    """
+    same = (os.path.normcase(os.path.abspath(root))
+            == os.path.normcase(os.path.abspath(dest)))
+    if not same:
+        return os.path.basename(root)
+    stems = _toc_stems(root)
+    if expected and any(s.lower() == expected.lower() for s in stems):
+        return expected
+    if expected and any(s.lower().startswith(expected.lower()) for s in stems):
+        return expected
+    if stems:
+        return min(stems, key=len)
+    return expected or os.path.basename(root)
+
+
+def toc_version(folder):
+    """Dotted digits from the first `## Version:` line in the folder's tocs."""
+    for stem in _toc_stems(folder):
+        try:
+            with open(os.path.join(folder, stem + ".toc"),
+                      encoding="utf-8-sig", errors="replace") as fh:
+                for line in fh:
+                    m = re.match(r"\s*##\s*Version\s*:\s*(.+)", line, re.I)
+                    if m:
+                        ver = ".".join(re.findall(r"\d+", m.group(1)))
+                        if ver:
+                            return ver
+        except OSError:
+            continue
+    return ""
 
 
 def make_zip(folder, zip_path):
@@ -596,12 +670,34 @@ def prune(directory, pattern, keep):
             pass
 
 
-def publish(flavor, addon_dir, version, archive, source, cfg):
+def _sweep_stale_stages(dest, older_than=3600):
+    # A crash between staging and cleanup leaves .new-*/.old-* in the served
+    # folder. Only old ones go: on Windows there is no lock, and a young one
+    # may belong to a run still in progress.
+    now = time.time()
+    try:
+        names = os.listdir(dest)
+    except OSError:
+        return
+    for name in names:
+        if not (name.startswith(".new-") or name.startswith(".old-")):
+            continue
+        path = os.path.join(dest, name)
+        try:
+            if now - os.path.getmtime(path) > older_than:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def publish(flavor, addon_dir, version, archive, source, cfg,
+            addon_name=None):
     meta = FLAVORS[flavor]
     pub_root = publish_dir(cfg)
     dest = os.path.join(pub_root, flavor)
     os.makedirs(dest, exist_ok=True)
-    addon_name = os.path.basename(addon_dir)
+    _sweep_stale_stages(dest)
+    addon_name = addon_name or os.path.basename(addon_dir)
 
     stage = os.path.join(dest, ".new-%s" % uuid.uuid4().hex[:8])
     os.makedirs(stage, exist_ok=True)
@@ -654,14 +750,20 @@ def import_archive(path, cfg, st, force=False):
             root = find_addon_root(tmp)
             if not root:
                 return []
-            addon = os.path.basename(root).lower()
+            addon = addon_name_for(root, tmp).lower()
             for f, meta in FLAVORS.items():
                 if addon == meta["addon"].lower():
                     flavor = f
                     break
             if not flavor:
                 return []
-            ver = ver or "0"
+            # The name carries no version, so the toc must. A made-up "0"
+            # would compare equal to the next release and block it forever.
+            ver = toc_version(root)
+            if not ver:
+                raise RuntimeError(
+                    "cannot tell the version of %s: the file name has none "
+                    "and the .toc has no ## Version" % os.path.basename(path))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     if not force and not newer(ver, st["flavors"].get(flavor, {}).get("version")):
@@ -672,10 +774,12 @@ def import_archive(path, cfg, st, force=False):
     tmp = tempfile.mkdtemp(prefix="addon-sync-%s-" % flavor, dir=STAGE)
     try:
         extract_archive(path, tmp)
-        root = find_addon_root(tmp, FLAVORS[flavor]["addon"])
+        expected = FLAVORS[flavor]["addon"]
+        root = find_addon_root(tmp, expected)
         if not root:
             raise RuntimeError("no .toc found in %s" % path)
-        entry = publish(flavor, root, ver, path, "archive", cfg)
+        entry = publish(flavor, root, ver, path, "archive", cfg,
+                        addon_name=addon_name_for(root, tmp, expected))
         st["flavors"][flavor] = entry
         save_state(st)
         log("published %s %s (%s)" % (flavor, ver, human(entry["size"])))
@@ -684,7 +788,15 @@ def import_archive(path, cfg, st, force=False):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _record_import_error(st, what, exc):
+    log("import %s failed: %s" % (what, exc))
+    msg = "%s: %s" % (what, exc)
+    st["last_error"] = ("%s; %s" % (st["last_error"], msg)
+                        if st.get("last_error") else msg)
+
+
 def import_archives(paths, cfg, st, force=False):
+    """Import what is new. Failures land in st["last_error"] (joined)."""
     done = []
     by_flavor = {}
     for p in paths:
@@ -697,8 +809,7 @@ def import_archives(paths, cfg, st, force=False):
             try:
                 done += import_archive(by_flavor[flavor][1], cfg, st, force)
             except Exception as exc:
-                log("import %s failed: %s" % (flavor, exc))
-                st["last_error"] = "%s: %s" % (flavor, exc)
+                _record_import_error(st, flavor, exc)
     # archives whose name did not identify a flavor
     for p in paths:
         if parse_release(os.path.basename(p))[0]:
@@ -707,7 +818,7 @@ def import_archives(paths, cfg, st, force=False):
             try:
                 done += import_archive(p, cfg, st, force)
             except Exception as exc:
-                log("import %s failed: %s" % (os.path.basename(p), exc))
+                _record_import_error(st, os.path.basename(p), exc)
     return done
 
 
@@ -758,6 +869,7 @@ def run_check(force=False, triggered=False):
         # magnets only).
         st["needs_login"] = (feed["source"] == "browser"
                              and not feed["items"]
+                             and not feed.get("bundles")
                              and not feed.get("attachments"))
         st["last_feed"] = {"source": feed["source"],
                            "fingerprint": feed["fingerprint"],
@@ -803,11 +915,19 @@ def run_check(force=False, triggered=False):
                         if archive_matches(n)]
 
         archives = [p for p in archives if os.path.exists(p)]
+        st["last_error"] = ""
         done = import_archives(archives, cfg, st, force=force)
         build_manifest(cfg, st)
-        st["last_ok"] = int(time.time())
-        st["last_error"] = ""
+        failed = st["last_error"]
+        if not failed:
+            st["last_ok"] = int(time.time())
         save_state(st)
+        if failed:
+            # The previous publish of a failed flavor is untouched; say so
+            # loudly instead of reporting a healthy check.
+            log("check done with errors: %d updated; %s" % (len(done), failed))
+            return {"ok": False, "updated": done, "error": failed,
+                    "state": st}
         log("check done: %d updated" % len(done))
         return {"ok": True, "updated": done, "state": st}
     except Exception as exc:
@@ -835,11 +955,16 @@ def import_from_downloads(force=False):
     for name in os.listdir(incoming):
         if archive_matches(name):
             paths.append(os.path.join(incoming, name))
+    st["last_error"] = ""
     done = import_archives(paths, cfg, st, force=force)
     build_manifest(cfg, st)
-    st["last_ok"] = int(time.time())
+    if not st["last_error"]:
+        st["last_ok"] = int(time.time())
     save_state(st)
-    return done
+    out = {"ok": not st["last_error"], "updated": done}
+    if st["last_error"]:
+        out["error"] = st["last_error"]
+    return out
 
 
 # ---------------------------------------------------------------- status
@@ -898,7 +1023,7 @@ def main(argv):
         triggered = "--triggered" in argv or "--scheduled" in argv
         out = run_check(force=force, triggered=triggered)
     elif cmd == "import":
-        out = {"ok": True, "updated": import_from_downloads(force="--force" in argv)}
+        out = import_from_downloads(force="--force" in argv)
     elif cmd == "status":
         out = status_data()
     elif cmd == "trigger":
