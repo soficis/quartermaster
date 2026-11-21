@@ -6,7 +6,8 @@
   Builds a throwaway publish folder and a fake WoW install, then drives the
   real script as a child process. Covers: -WhatIf writes nothing, install,
   "up to date", upgrade with backup, corrupt sha256 leaves the old addon in
-  place, and Setup.ps1 -NoSchedule stops after writing the config.
+  place, Setup.ps1 -NoSchedule stops after writing the config, and both
+  scheduler installers honour -WhatIf and refuse bad times.
 
   No network, no real scheduler, no real game folder. Exits 1 when a check fails.
 
@@ -21,6 +22,7 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $client = Split-Path -Parent $here
 $sync = Join-Path $client "sync.ps1"
 $setup = Join-Path $client "Setup.ps1"
+$feedSched = Join-Path (Split-Path -Parent $client) "feed/Install-FeedSchedule.ps1"
 $hostExe = (Get-Process -Id $PID).Path
 
 $script:failed = 0
@@ -91,6 +93,12 @@ function Invoke-Sched([string[]]$Extra = @()) {
   # (Task Scheduler, launchd, systemd) untouched.
   $ErrorActionPreference = "Continue"
   $out = & $hostExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $client "Install-Schedule.ps1") @Extra 2>&1
+  [pscustomobject]@{ Code = $LASTEXITCODE; Output = (@($out) -join "`n") }
+}
+
+function Invoke-FeedSched([string[]]$Extra = @()) {
+  $ErrorActionPreference = "Continue"
+  $out = & $hostExe -NoProfile -ExecutionPolicy Bypass -File $feedSched @Extra 2>&1
   [pscustomobject]@{ Code = $LASTEXITCODE; Output = (@($out) -join "`n") }
 }
 
@@ -254,6 +262,13 @@ try {
   Check ((@($again.Include) -join ",") -eq "classic" -and $again.BackupDir -eq "D:\Backups") "setup rerun keeps Include and BackupDir"
   Check ((@($again.Roots) -join ",") -eq $wowB) "setup rerun updates Roots"
 
+  # -Roots a,b from -File (bash/cmd) arrives as one string; it must not
+  # become a single bogus root.
+  $out = & $hostExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $setupCopy "Setup.ps1") `
+    -ManifestBase $publish -Roots "$wow,$wowB" -Yes -NoSchedule 2>&1
+  $both = Get-Content -LiteralPath $setupCfg -Raw | ConvertFrom-Json
+  Check (@($both.Roots).Count -eq 2) "a comma-separated -Roots is split"
+
   # Install-Schedule: "-Times 07:30,19:30" is one string when the script is run
   # with -File from bash or cmd, and used to become an unschedulable unit that
   # was reported as enabled. -WhatIf keeps the real scheduler untouched.
@@ -268,6 +283,25 @@ try {
   Check (!$leaked) "install-schedule -WhatIf registers nothing"
   $s = Invoke-Sched @("-Times", "nonsense", "-TaskName", "AddonSyncSmoke", "-WhatIf")
   Check ($s.Code -ne 0 -and $s.Output -match "bad -Times") "a bad -Times value is refused"
+  $s = Invoke-Sched @("-TaskName", "AddonSyncSmoke", "-Uninstall", "-WhatIf")
+  Check ($s.Code -eq 0 -and $s.Output -match "What if" -and
+    $s.Output -notmatch "removed\.") "install-schedule -Uninstall honours -WhatIf"
+
+  # The feed scheduler is the same kind of script; dry-run it here so a
+  # macOS/Windows/Linux branch cannot regress unnoticed.
+  $s = Invoke-FeedSched @("-At", "05:30", "-TaskName", "AddonFeedSmoke", "-WhatIf")
+  Check ($s.Code -eq 0) "feed scheduler accepts a normal -At"
+  Check ($s.Output -match "What if") "feed scheduler honours -WhatIf"
+  $feedLeak = if (!$IsLinux -and !$IsMacOS) {
+    $null -ne (Get-ScheduledTask -TaskName "AddonFeedSmoke" -ErrorAction SilentlyContinue)
+  } elseif ($IsMacOS) {
+    Test-Path -LiteralPath (Join-Path $HOME "Library/LaunchAgents/com.addonsync.feed.plist")
+  } else {
+    Test-Path -LiteralPath (Join-Path $HOME ".config/systemd/user/AddonFeedSmoke.timer")
+  }
+  Check (!$feedLeak) "feed scheduler -WhatIf registers nothing"
+  $s = Invoke-FeedSched @("-At", "nonsense", "-TaskName", "AddonFeedSmoke", "-WhatIf")
+  Check ($s.Code -ne 0 -and $s.Output -match "bad -At") "a bad -At value is refused"
 }
 finally {
   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue

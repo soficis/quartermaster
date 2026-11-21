@@ -92,8 +92,17 @@ function Find-Browser {
     "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
     "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
     "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
-    "$env:ProgramFiles\Chromium\Application\chrome.exe"
+    "$env:ProgramFiles\Chromium\Application\chrome.exe",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
   ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if (!$cands) {
+    foreach ($name in @("google-chrome", "chromium", "chromium-browser", "chrome")) {
+      $cmd = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($cmd) { $cands = $cmd.Source; break }
+    }
+  }
   if (-not $cands) { throw ("no browser found. Pass -BrowserExe with the path to Edge, Chrome or Chromium.") }
   return [string]$cands
 }
@@ -125,8 +134,11 @@ function Receive-Cdp($ws, [int]$id, [int]$timeoutMs = 20000) {
 }
 
 $exe = Find-Browser
+# Quote the profile path: the macOS default lives under "Application Support",
+# and an unquoted --user-data-dir would be split at the space.
 $proc = Start-Process -FilePath $exe -ArgumentList @(
-  "--remote-debugging-port=$Port", "--user-data-dir=$Profile",
+  "--remote-debugging-port=$Port",
+  ('--user-data-dir="{0}"' -f $Profile),
   "--no-first-run", "--no-default-browser-check", $ThreadUrl) -PassThru
 try {
   $page = $null

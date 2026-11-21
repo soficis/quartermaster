@@ -144,6 +144,33 @@ class ArchiveTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 worker.extract_archive(path, os.path.join(self.tmp, "x"))
 
+    def _extract_cmd(self, path, found):
+        with mock.patch.object(worker.shutil, "which",
+                               side_effect=lambda name: found.get(name)):
+            with mock.patch.object(worker.subprocess, "run") as run:
+                worker.extract_archive(path, os.path.join(self.tmp, "x"))
+        return run.call_args[0][0]
+
+    def test_extract_7z_accepts_homebrew_7zz(self):
+        cmd = self._extract_cmd(os.path.join(self.tmp, "a.7z"),
+                                {"7zz": "/opt/homebrew/bin/7zz"})
+        self.assertEqual(cmd[0], "/opt/homebrew/bin/7zz")
+        self.assertIn("-o" + os.path.join(self.tmp, "x"), cmd)
+
+    def test_extract_7z_falls_back_to_unar(self):
+        cmd = self._extract_cmd(os.path.join(self.tmp, "a.7z"),
+                                {"unar": "/usr/local/bin/unar"})
+        self.assertEqual(cmd, ["/usr/local/bin/unar", "-f", "-o",
+                               os.path.join(self.tmp, "x"),
+                               os.path.join(self.tmp, "a.7z")])
+
+    def test_extract_rar_keeps_unrar_argument_order(self):
+        cmd = self._extract_cmd(os.path.join(self.tmp, "a.rar"),
+                                {"unrar": "/usr/bin/unrar"})
+        self.assertEqual(cmd, ["/usr/bin/unrar", "x", "-o+", "-y",
+                               os.path.join(self.tmp, "a.rar"),
+                               os.path.join(self.tmp, "x") + os.sep])
+
 
 class PublishTests(unittest.TestCase):
     def setUp(self):

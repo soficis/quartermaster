@@ -29,6 +29,11 @@ $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $cfgPath = Join-Path $here "sync.config.json"
 
+# "-Roots a,b" is one string when the script is run with -File from a shell
+# that does not split it (bash, cmd); accept it and a real array alike.
+$Roots = @($Roots | ForEach-Object { $_ -split ',' } |
+  ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
 function Ask([string]$Prompt, [string]$Default) {
   if ($Default) { $Prompt += " [$Default]" }
   $a = Read-Host $Prompt

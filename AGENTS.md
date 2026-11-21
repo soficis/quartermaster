@@ -81,8 +81,10 @@ $PSVersionTable.PSVersion            # need 5.1+ for the client
 Browser: Chromium, Chrome, or Edge must be installed. The worker finds it;
 you do not set a path. On Windows, if `unrar` is missing but WinRAR is
 installed, copy `UnRAR.exe` to `unrar.exe` in the WinRAR folder and add
-that folder to the user `PATH`, then reopen the shell. `.zip` releases
-need nothing; other formats need `7z` on `PATH`. On Debian, `install.sh`
+that folder to the user `PATH`, then reopen the shell. On macOS, `brew
+install python unar` (the stock `/usr/bin/python3` is a stub until the
+Command Line Tools are installed). `.zip` releases need nothing; other
+formats need `7z`/`7zz` or `unar` on `PATH`. On Debian, `install.sh`
 handles all of it.
 
 ## Shape A: one PC (default)
@@ -138,13 +140,18 @@ python feed/worker.py check --force     # exit 0, flavors populated
 the user wants different times, use `-Times "06:00","18:00"`. `-NoSchedule`
 writes the config and registers nothing.
 
-On Windows, schedule the feed half too:
+Schedule the feed half too:
 
 ```powershell
-.\feed\Install-FeedSchedule.ps1    # task AddonFeed, daily 05:30 + jitter
+.\feed\Install-FeedSchedule.ps1    # daily 05:30 + jitter; Task Scheduler,
+                                   # launchd, or a systemd user timer
 ```
 
-`-At "06:00"`, `-RandomMinutes 0`, `-Uninstall`, and `-WhatIf` work.
+`-At "06:00"`, `-RandomMinutes 0`, `-Uninstall`, and `-WhatIf` work. On
+Windows the task is `AddonFeed`; on macOS the launchd label is
+`com.addonsync.feed`; on Linux the user timer is `AddonFeed.timer`. On a
+root-run Debian host, `install.sh` already registered
+`addonsync-feed.timer`; use one or the other.
 
 ## Shape B: always-on Debian-like host
 
@@ -200,8 +207,9 @@ target install. Then check the schedulers exist:
 
 ```powershell
 Get-ScheduledTask -TaskName AddonSync, AddonFeed          # Windows
-systemctl --user list-timers AddonSync.timer
-systemctl list-timers addonsync-feed.timer                 # feed host
+launchctl list | Select-String com.addonsync              # macOS (client + feed)
+systemctl --user list-timers AddonSync.timer, AddonFeed.timer  # Linux user
+systemctl list-timers addonsync-feed.timer                 # Linux after install.sh
 ```
 
 If you changed code, run before reporting:

@@ -52,6 +52,7 @@ if (!$pwsh) { throw "pwsh not found - install PowerShell 7 first (https://aka.ms
 function Quote([string]$s) { return '"{0}"' -f ($s -replace '"', '""') }
 
 if ($Uninstall) {
+  if (!$PSCmdlet.ShouldProcess($TaskName, "remove the schedule")) { return }
   if ($isWin) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
   } elseif ($IsMacOS) {

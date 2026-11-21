@@ -583,26 +583,39 @@ def http_download(url, cfg, dest_dir):
 
 # ---------------------------------------------------------------- extract/publish
 
+def _extract_with(exe, path, dest):
+    """Run unrar/7z/unar with the flags that tool understands."""
+    name = os.path.basename(exe).lower()
+    if name.startswith("unar"):
+        # unar handles rar and 7z, and uses -o for the output directory.
+        cmd = [exe, "-f", "-o", dest, path]
+    elif name.startswith("7z"):
+        cmd = [exe, "x", "-y", "-o" + dest, path]
+    else:
+        # unrar takes the archive then the destination directory.
+        cmd = [exe, "x", "-o+", "-y", path, dest + os.sep]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
 def extract_archive(path, dest):
     os.makedirs(dest, exist_ok=True)
     low = path.lower()
     if low.endswith(".rar"):
         exe = shutil.which("unrar") or shutil.which("unar")
         if not exe:
-            raise RuntimeError("no rar extractor (install unrar)")
-        cmd = [exe, "x", "-o+", "-y", path, dest + os.sep]
-        if os.path.basename(exe) == "unar":
-            cmd = [exe, "-f", "-o", dest, path]
-        subprocess.run(cmd, check=True, capture_output=True)
+            raise RuntimeError("no rar extractor (install unrar or unar)")
+        _extract_with(exe, path, dest)
     elif low.endswith(".zip"):
         with zipfile.ZipFile(path) as zf:
             zf.extractall(dest)
     else:
-        exe = shutil.which("7z") or shutil.which("7za")
+        # Homebrew's sevenzip package installs 7zz, not 7z; unar covers 7z
+        # on a Mac that has no 7-Zip at all.
+        exe = (shutil.which("7z") or shutil.which("7zz")
+               or shutil.which("7za") or shutil.which("unar"))
         if not exe:
-            raise RuntimeError("no extractor for %s" % path)
-        subprocess.run([exe, "x", "-y", "-o" + dest, path],
-                       check=True, capture_output=True)
+            raise RuntimeError("no extractor for %s (install 7z or unar)" % path)
+        _extract_with(exe, path, dest)
 
 
 def find_addon_root(dest, expected=""):

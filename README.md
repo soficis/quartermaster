@@ -49,7 +49,7 @@ ways. Two halves meet at one file: `manifest.json`.
 | feed builder | reads the page, fetches releases, publishes addon folders + zips + manifest | `feed/` |
 | sync client | reads the manifest, verifies SHA-256, backs up, replaces | `client/` |
 | cookie export | hands your browser session to the feed | `tools/` |
-| installers | feed timer (Linux) or scheduled task (Windows); client Task Scheduler / launchd / systemd user timer | `feed/install.sh`, `feed/Install-FeedSchedule.ps1`, `client/Install-Schedule.ps1` |
+| installers | feed + client schedulers on Windows (Task Scheduler), macOS (launchd) and Linux (systemd) | `feed/install.sh`, `feed/Install-FeedSchedule.ps1`, `client/Install-Schedule.ps1` |
 | optional portal | a web page listing builds, for an existing home portal | `examples/homelab/` |
 
 ```
@@ -92,7 +92,7 @@ them, and puts them where the game reads them.
 | Shape | Feed runs on | PCs read it via | Good when |
 |---|---|---|---|
 | **A. One PC** | your gaming PC | a local folder | you have one machine |
-| **B. Home box** | an always-on Linux/Windows box | SMB/NFS share | several PCs, one always-on box |
+| **B. Home box** | an always-on computer | SMB/NFS share | several PCs, one always-on box |
 | **C. Static HTTP** | any box with Python | `http://host:8000` | you want no file shares |
 | **D. Portal** | an existing home portal | the portal's page | you already run one |
 | **E. Direct links only** | your gaming PC | a local folder | you run no torrent client |
@@ -137,7 +137,7 @@ probably wrong for your setup.
 |---|---|
 | Python 3.7+ | feed builder. Stdlib only, no pip. |
 | Chromium, Chrome, or Edge | the feed reads the page through a real browser |
-| a RAR extractor on `PATH` | `unrar` or `unar`; `install.sh` installs `unrar` |
+| a RAR extractor on `PATH` | `unrar` or `unar`; `.7z` also takes `7z`, `7zz` or `unar`; `install.sh` installs `unrar` |
 | PowerShell 5.1+ | client. 5.1 on Windows, 7+ elsewhere. |
 | a torrent client | only for magnet links; not needed with `direct` |
 | a session on the page | if the source has a login wall; one sign-in lasts months |
@@ -147,9 +147,15 @@ On Windows, WinRAR ships `UnRAR.exe`, not `unrar.exe`. Copy it to
 shell. Or install `unar`. `.zip` releases need nothing; other formats need
 7-Zip (`7z`).
 
-macOS has no PowerShell by default: the client and its launchd installer
-need PowerShell 7 from <https://aka.ms/ps7>. The `.tar.gz` release unpacks
-under your home folder and needs no admin rights.
+macOS has no PowerShell by default: the client, the cookie exporter, and both
+scheduler installers need PowerShell 7 from <https://aka.ms/ps7>. The
+`.tar.gz` release unpacks under your home folder and needs no admin rights.
+Python 3 and a RAR extractor are not part of a stock macOS either:
+`brew install python unar` (or Python from python.org) covers the feed. The
+system `/usr/bin/python3` is only a stub until the Command Line Tools are
+installed, and the feed scheduler refuses it rather than registering a job
+that cannot run. Chrome or Chromium is found in `/Applications`; no path
+setting is needed.
 
 ## Feeds and presets
 
@@ -244,15 +250,22 @@ comma-separated (`-Times 06:30,18:30`); anything else is refused before
 anything is registered. `-WhatIf` shows what it would do, and `-Uninstall`
 removes it.
 
-The feed half needs a schedule too. On Windows:
+The feed half needs a schedule too. The same installer works on every
+platform:
 
 ```powershell
-.\feed\Install-FeedSchedule.ps1   # task AddonFeed, daily 05:30 + up to 3h jitter
+.\feed\Install-FeedSchedule.ps1   # daily 05:30 + up to 3h spread
 ```
 
-It runs `worker.py check --scheduled`. The random offset keeps many machines
-from hitting the page at once. `-At "06:00"`, `-RandomMinutes 0`,
-`-Uninstall`, and `-WhatIf` also work.
+It runs `worker.py check --scheduled`. On Windows and Linux the spread is
+picked on every run (Task Scheduler `RandomDelay`, systemd
+`RandomizedDelaySec`); launchd has no per-run random delay, so on macOS the
+installer picks one random offset now and keeps it. `-At "06:00"`,
+`-RandomMinutes 0`, `-Uninstall`, and `-WhatIf` also work everywhere.
+
+On a Linux box you control as root, `feed/install.sh` is still the
+system-wide alternative; use one or the other. A user timer only fires while
+you are logged in unless lingering is on.
 
 ## Manual setup: always-on feed host
 
@@ -342,13 +355,15 @@ Run these four. Each is read-only.
 python feed/worker.py status      # last_ok, last_error, needs_login, preset, flavors
 python feed/reader.py status      # browser up? page open?
 .\client\sync.ps1 -WhatIf         # what would be installed, touches nothing
-Get-ScheduledTask -TaskName AddonSync, AddonFeed   # Windows; see below
+Get-ScheduledTask -TaskName AddonSync, AddonFeed   # Windows
 ```
 
-On Linux, the last line is
-`systemctl list-timers addonsync-feed.timer` for the feed and
-`systemctl --user list-timers AddonSync.timer` for the client. On macOS the
-client is a launchd agent: `launchctl list | Select-String com.addonsync`.
+On macOS both halves are launchd agents:
+`launchctl list | Select-String com.addonsync` (the feed label is
+`com.addonsync.feed`). On Linux the feed timer is
+`systemctl --user list-timers AddonFeed.timer` (or
+`systemctl list-timers addonsync-feed.timer` after `feed/install.sh`), and
+the client is `systemctl --user list-timers AddonSync.timer`.
 
 Healthy looks like:
 
@@ -366,13 +381,20 @@ Healthy looks like:
 - **The version looks odd** - the `.toc` carries `major.minor`; the real
   build number comes from the archive name. When the name carries no
   version, the `.toc` must, or the check fails instead of publishing `0`.
-- **`-Times` refused** - the scheduler installer takes `HH:mm` only and
-  stops before registering anything, rather than writing a task or timer
-  that cannot fire.
+- **`-Times` or `-At` refused** - the scheduler installers take `HH:mm`
+  only and stop before registering anything, rather than writing a task or
+  timer that cannot fire.
+- **`-Uninstall -WhatIf`** - reports what it would remove and removes
+  nothing, on every platform.
 - **Empty watch folder** - the torrent client never delivered. The check
   fails loudly after `timeout_min` rather than hanging.
 - **`no rar extractor`** - install `unrar` or `unar` on the PATH of the
-  account that runs the feed.
+  account that runs the feed. On macOS, a launchd job gets a minimal PATH;
+  the installer writes your install-time PATH into the plist, so install the
+  extractor before running it.
+- **`python at ... does not run`** - on macOS that is the Command Line Tools
+  stub, on Windows the Microsoft Store alias. Install Python 3 (or pass
+  `-Python <exe>`), then run the installer again.
 - **The client says up to date but the addon is old** - it compares versions
   first; check `.synced-version` in the installed folder.
 - **Nothing installed on a fresh PC** - no WTF data means no active root. Run
@@ -404,20 +426,22 @@ or `git push`.
 A clean checkout runs green with no setup:
 
 ```powershell
-python -m unittest discover -s tests -v     # 55 tests, feed side
-.\client\tests\smoke.ps1                     # end-to-end client, 38 checks
+python -m unittest discover -s tests -v     # 58 tests, feed side
+.\client\tests\smoke.ps1                     # end-to-end client, 44 checks
 ```
 
 The client smoke test builds a throwaway WoW root and publish folder, then
 runs the real `sync.ps1`: dry run, install, up-to-date, upgrade with
 backup, a corrupted hash that must be rejected, a manifest entry with no
 checksum that must be refused, and two roots sharing one flavor that must
-get separate backups. It also dry-runs the client scheduler installer and
-checks that a bad `-Times` is refused.
+get separate backups. It also dry-runs both scheduler installers, checks
+that bad `-Times`/`-At` values are refused, that `-Uninstall -WhatIf`
+removes nothing, and that a comma-separated `-Roots` becomes two roots.
 
 The feed tests cover version ordering, release-name and URL fallbacks,
-magnet handling, opaque download names, archive extraction, import
-failures, publish + manifest, and every preset that ships.
+magnet handling, opaque download names, archive extraction (including
+Homebrew's `7zz` and `unar` for `.7z`), import failures, publish + manifest,
+and every preset that ships.
 
 `.github/workflows/ci.yml` runs the tests on Python 3.7, 3.8 and 3.12, runs
 the client smoke test under both Windows PowerShell 5.1 and PowerShell 7,
@@ -425,9 +449,14 @@ dry-runs both scheduler installers, parses every PowerShell file, and
 syntax-checks `install.sh`.
 
 The same suite also passes on macOS 12.7 (PowerShell 7.4) and Ubuntu
-(PowerShell 7.7). A real scheduler was registered and removed on each:
-a Scheduled Task on Windows, a launchd agent on macOS, and a systemd user
-timer on Linux.
+26.04 (PowerShell 7.7). A real scheduler was registered, run where it made
+sense, and removed on each: a Scheduled Task on Windows, launchd agents
+for both halves on macOS, and systemd user timers for both halves on
+Linux. On macOS the feed agent ran a real check against a local page:
+headless Chrome read it, the zip downloaded and extracted, and the addon
+plus manifest landed in `publish`. The cookie exporter was also run there:
+it found Chrome in `/Applications`, used the default profile path
+containing a space, and wrote the cookie JSON.
 
 ## Repo map
 
@@ -441,7 +470,7 @@ feed/
   config.example.json       pick a preset; everything else has a default
   manual-feed.example.json  fallback links for when the browser cannot read
   install.sh                Linux service setup (packages, /opt/addon-sync, timer)
-  Install-FeedSchedule.ps1  Windows scheduled task for the feed
+  Install-FeedSchedule.ps1  feed scheduler: Task Scheduler / launchd / systemd user timer
   addonsync-feed.service    oneshot check (overridable via ADDONSYNC_* env)
   addonsync-feed.timer      once daily at a random time
 client/
