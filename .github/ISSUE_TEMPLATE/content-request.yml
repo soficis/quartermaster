@@ -1,0 +1,29 @@
+name: Content or naming change
+description: Ask for a link, a name, or an example feed to be changed or removed.
+title: "[content] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The examples live in `feeds/`, one JSON file each. Say what you would
+        like changed and it will be done in the next commit.
+  - type: input
+    id: what
+    attributes:
+      label: What is affected
+      description: A link, a name, a feed file, or the repository description.
+      placeholder: feeds/five-flavors-example.json
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: What you would like changed
+      placeholder: Remove it, rename it, point it somewhere else.
+    validations:
+      required: true
+  - type: input
+    id: contact
+    attributes:
+      label: Contact (optional)
+      description: Only if you want a reply somewhere other than this thread.

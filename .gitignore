@@ -1,0 +1,23 @@
+# ---- local machine config (your hosts, paths, secrets) ----
+client/sync.config.json
+feed/config.json
+examples/homelab/deploy.config.json
+
+# ---- secrets that must never be committed ----
+*.pw
+*cookie*.json
+
+# ---- runtime junk ----
+__pycache__/
+*.pyc
+*.log
+feed/state/
+browser-profile/
+*.bak-*
+addon-sync-*.zip
+
+# ---- local history; never published ----
+archive/
+
+# ---- your own feed presets; the repo ships neutral examples ----
+feeds/local-*.json

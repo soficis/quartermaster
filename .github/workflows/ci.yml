@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: compile
+        run: |
+          python -m py_compile feed/worker.py feed/reader.py \
+            examples/homelab/plugins/addons.py
+      - name: unit tests
+        run: python -m unittest discover -s tests -v
+      - name: workers answer with JSON and no config
+        env:
+          ADDONSYNC_STATE_DIR: ${{ runner.temp }}/state
+        run: |
+          python feed/worker.py status | python -c "import json,sys; d=json.load(sys.stdin); assert 'flavors' in d, d"
+          python feed/reader.py status | python -c "import json,sys; d=json.load(sys.stdin); assert 'port' in d, d"
+      - name: presets load by name and by path
+        env:
+          ADDONSYNC_STATE_DIR: ${{ runner.temp }}/state2
+        run: |
+          python feed/worker.py status | python -c "import json,sys; d=json.load(sys.stdin); assert d['preset']=='generic example', d"
+          ADDONSYNC_PRESET=five-flavors-example python feed/worker.py status | python -c "import json,sys; d=json.load(sys.stdin); assert d['preset']=='five flavor example', d"
+          ADDONSYNC_PRESET=feeds/five-flavors-example.json python feed/worker.py status | python -c "import json,sys; d=json.load(sys.stdin); assert len(d['order'])==5, d"
+
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: parse every script
+        shell: pwsh
+        run: |
+          $bad = @()
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $file = $_
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $file.FullName, [ref]$null, [ref]$errors)
+            foreach ($e in @($errors)) {
+              $bad += "$($file.Name):$($e.Extent.StartLineNumber) $($e.Message)"
+            }
+          }
+          if ($bad.Count) { $bad | Write-Host; exit 1 }
+          Write-Host "all scripts parse"
+      - name: client end-to-end
+        shell: pwsh
+        run: ./client/tests/smoke.ps1
+      - name: scheduler installers dry-run
+        shell: pwsh
+        run: |
+          ./feed/Install-FeedSchedule.ps1 -WhatIf
+          ./client/Install-Schedule.ps1 -TaskName AddonSyncCiDryRun -WhatIf
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh parses
+        run: bash -n feed/install.sh

@@ -1,0 +1,18 @@
+{
+  "_comment": "A neutral template: one addon, HTTP links only, no torrent client and no forum login. Point thread_url at any page that links .zip files, or drop archives into <state>/incoming and run `worker.py import`. This is the whole shape of a feed: a page, a naming rule, and a list of addon folders.",
+  "name": "generic example",
+  "thread_url": "",
+  "release_prefix": "",
+  "archive_pattern": "",
+  "downloader": {
+    "method": "direct"
+  },
+  "flavors": {
+    "retail": {
+      "label": "Retail",
+      "addon": "DemoAddon",
+      "wow": "_retail_",
+      "rank": 0
+    }
+  }
+}

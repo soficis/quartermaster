@@ -1,0 +1,15 @@
+{
+  "_comment": "Manual fallback feed. The browser is the normal reader; this file is used only when it cannot read the thread. Copy to <state>/manual-feed.json (or point manual_feed_file at it).",
+  "flavors": {
+    "forever": {
+      "version": "1.6.37656",
+      "url": "magnet:?xt=urn:btih:70868ea9a8b44dd956f5ab80d263c28c329aac43&dn=Addons"
+    }
+  },
+  "bundles": [
+    {
+      "name": "Addons",
+      "url": "magnet:?xt=urn:btih:70868ea9a8b44dd956f5ab80d263c28c329aac43&dn=Addons"
+    }
+  ]
+}

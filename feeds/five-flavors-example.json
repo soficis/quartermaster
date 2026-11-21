@@ -1,0 +1,42 @@
+{
+  "_comment": "One feed, five flavors. A flavor is a WoW client generation; the addon folder name differs per client, so one release unpacks into the right folder for each. Copy this when your source publishes an archive per client. thread_url is blank here: point it at the page you read, and it works the same whether or not that page needs a login, because the reader uses a browser you signed in to.",
+  "name": "five flavor example",
+  "thread_url": "",
+  "release_prefix": "Demo",
+  "archive_pattern": "Demo",
+  "downloader": {
+    "method": "direct"
+  },
+  "flavors": {
+    "forever": {
+      "label": "Forever",
+      "addon": "DemoAddonForever",
+      "wow": "_forever_",
+      "rank": 0
+    },
+    "retail": {
+      "label": "Retail",
+      "addon": "DemoAddon",
+      "wow": "_retail_",
+      "rank": 1
+    },
+    "anniversary": {
+      "label": "Anniversary",
+      "addon": "DemoAddonClassicAnniv",
+      "wow": "_anniversary_",
+      "rank": 2
+    },
+    "classic": {
+      "label": "Classic",
+      "addon": "DemoAddonClassicTBC",
+      "wow": "_classic_",
+      "rank": 3
+    },
+    "era": {
+      "label": "Era",
+      "addon": "DemoAddonClassic",
+      "wow": "_classic_era_",
+      "rank": 4
+    }
+  }
+}

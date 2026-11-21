@@ -1,0 +1,23 @@
+{
+  "_comment": "Copy to config.json next to worker.py (service installs use /etc/addon-sync.json). `preset` picks a feed definition from feeds/ and supplies thread_url, the addon folders and the release naming; anything set here overrides the preset. Empty strings fall back to folders under the state directory.",
+  "preset": "generic-example",
+  "thread_url": "",
+  "check_hours": 24,
+  "publish_dir": "",
+  "downloads_dir": "",
+  "manual_feed_file": "",
+  "downloader": {
+    "_comment": "method: watchdir (drop .magnet files for your torrent client), direct (http links only), or command (run this with {magnet} replaced).",
+    "method": "watchdir",
+    "watch_dir": "",
+    "completed_dir": "",
+    "timeout_min": 120,
+    "command": []
+  },
+  "keep_zips": 2,
+  "request_timeout": 40,
+  "browser_profile": "",
+  "browser_port": 9333,
+  "browser_display": ":99",
+  "browser_timeout": 60
+}

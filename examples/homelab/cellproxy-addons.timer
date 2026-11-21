@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the Addon feed once daily at a random time
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=18h
+AccuracySec=1m
+Persistent=true
+Unit=cellproxy-addons.service
+
+[Install]
+WantedBy=timers.target

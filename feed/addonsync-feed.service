@@ -1,0 +1,13 @@
+[Unit]
+Description=Addon feed check, download and publish
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=ADDONSYNC_STATE_DIR=/var/lib/addon-sync
+Environment=ADDONSYNC_CONFIG=/etc/addon-sync.json
+ExecStart=/usr/bin/python3 /opt/addon-sync/worker.py check --scheduled
+TimeoutStartSec=3h
+Nice=10
+IOSchedulingClass=idle

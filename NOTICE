@@ -1,0 +1,48 @@
+quartermaster
+Copyright (C) 2026 the quartermaster contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See LICENSE for the full text.
+
+--------------------------------------------------------------------------
+What it does
+
+quartermaster keeps addon folders in sync across the machines you own. It opens
+a page in a browser you are already signed in to, collects the archive links on
+it, hands them to a downloader you already run, unpacks what arrives, and copies
+the addon folder into a World of Warcraft install you name. A small JSON
+manifest lets the other machines pick up the same files.
+
+The engine itself is generic. What to fetch and what to call it live in
+feeds/*.json, one file per feed; the ones in this repository are examples.
+
+--------------------------------------------------------------------------
+Trademarks
+
+World of Warcraft and Blizzard Entertainment are trademarks or registered
+trademarks of Blizzard Entertainment, Inc. Addon names, site names, and
+product names in the example feeds belong to their respective owners and are
+used to describe what those examples point at.
+
+This project is not affiliated with, endorsed by, or sponsored by any of them.
+
+--------------------------------------------------------------------------
+No warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------
+If an example is yours
+
+Each example is one JSON file under feeds/. If you would like a link, a name,
+or a whole feed changed or removed, open an issue and it will be done:
+
+  https://github.com/soficis/quartermaster/issues/new?template=content-request.yml

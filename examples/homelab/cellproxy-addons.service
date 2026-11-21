@@ -1,0 +1,13 @@
+[Unit]
+Description=Addon feed check, download and publish
+Wants=network-online.target
+After=network-online.target cellproxy-dl.service
+
+[Service]
+Type=oneshot
+Environment=ADDONSYNC_CONFIG=/etc/cellproxy/addons.json
+Environment=ADDONSYNC_STATE_DIR=/var/lib/cellproxy/addons
+ExecStart=/usr/bin/python3 /usr/local/libexec/cellproxy/worker.py check --scheduled
+TimeoutStartSec=3h
+Nice=10
+IOSchedulingClass=idle

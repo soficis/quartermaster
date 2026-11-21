@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the addon feed once daily at a random time
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=18h
+AccuracySec=1m
+Persistent=true
+Unit=addonsync-feed.service
+
+[Install]
+WantedBy=timers.target

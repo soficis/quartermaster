@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy to deploy.config.json and fill in your values. deploy.config.json is gitignored and never committed.",
+  "PiHost": "your-pi-host-or-ip",
+  "PiUser": "root",
+  "HostKey": "paste-host-key-here",
+  "PwFile": "path-to-ssh-password-file",
+  "Plink": "path-to-plink.exe",
+  "PortalUrl": "http://your-pi-host-or-ip:8088/addons"
+}

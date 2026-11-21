@@ -1,0 +1,33 @@
+{
+  "_comment": "Neutral feed for the test-suite: a made-up site and a made-up addon, so the tests exercise the engine and not one particular feed.",
+  "name": "test example",
+  "thread_url": "https://forum.example.com/threads/1-demo.html",
+  "release_prefix": "Demo",
+  "archive_pattern": "Demo",
+  "flavors": {
+    "retail": {
+      "label": "Retail",
+      "addon": "DemoAddon",
+      "wow": "_retail_",
+      "rank": 0
+    },
+    "classic": {
+      "label": "Classic",
+      "addon": "DemoAddonClassic",
+      "wow": "_classic_",
+      "rank": 1
+    },
+    "anniversary": {
+      "label": "Anniversary",
+      "addon": "DemoAddonAnniv",
+      "wow": "_anniversary_",
+      "rank": 2
+    },
+    "era": {
+      "label": "Era",
+      "addon": "DemoAddonEra",
+      "wow": "_classic_era_",
+      "rank": 3
+    }
+  }
+}
