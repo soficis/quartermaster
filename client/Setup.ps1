@@ -59,7 +59,7 @@ if (Test-Path -LiteralPath $ManifestBase) {
   } else { Write-Host "publish folder OK." }
 } else {
   try {
-    $t = Invoke-RestMethod -Uri "$ManifestBase/manifest.json" -TimeoutSec 15
+    $t = Invoke-RestMethod -Uri "$ManifestBase/manifest.json" -TimeoutSec 15 -UseBasicParsing
     if (!$t.flavors) { Write-Warning "publish answered but has no flavors" }
     else { Write-Host "publish URL OK." }
   } catch {

@@ -232,6 +232,9 @@ def open_thread(port, url):
 
 def ensure_browser():
     """Chromium running with the thread open. Returns the debug port."""
+    url = thread_url()
+    if not url:
+        raise RuntimeError("no thread_url: set it in config.json or the preset")
     has_display = ensure_display()
     port = debug_port()
     if debugger_url(port):
@@ -246,10 +249,10 @@ def ensure_browser():
            "--password-store=basic", "--no-sandbox"]
     if has_display:
         env = dict(os.environ, DISPLAY=display())
-        cmd += ["--window-size=1400,1000", thread_url()]
+        cmd += ["--window-size=1400,1000", url]
     else:
         env = dict(os.environ)
-        cmd += ["--headless=new", thread_url()]
+        cmd += ["--headless=new", url]
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(os.path.join(STATE_DIR, "chromium.log"), "ab") as fh:
         proc = subprocess.Popen(cmd, env=env, stdout=fh, stderr=subprocess.STDOUT,
@@ -288,11 +291,12 @@ def _listener_pid(port):
     except (OSError, subprocess.SubprocessError):
         return None
     needle = ":%d" % port
+    # No state check: the word is localized ("ABHÖREN", ...) on non-English
+    # Windows, and a debug port never opens outbound twins to confuse it with.
     for line in out.splitlines():
         parts = line.split()
         if (len(parts) >= 5 and parts[0].upper() == "TCP"
-                and parts[1].endswith(needle)
-                and parts[3].upper() == "LISTENING"):
+                and parts[1].endswith(needle)):
             try:
                 return int(parts[4])
             except ValueError:
@@ -546,10 +550,15 @@ def import_cookies(path):
                 params["secure"] = True
             if c.get("httpOnly"):
                 params["httpOnly"] = True
+            # CDP takes `expires` (epoch seconds; omitted = session cookie),
+            # not `expirationDate`. Sending expirationDate: 0 would mark a
+            # session cookie as expired in 1970 and drop the login.
             try:
-                params["expirationDate"] = float(c.get("expires") or 0)
+                exp = float(c.get("expires") or 0)
             except (TypeError, ValueError):
-                pass
+                exp = 0
+            if exp > 0:
+                params["expires"] = exp
             same = (c.get("sameSite") or "").strip()
             if same.lower() in ("strict", "lax", "none"):
                 params["sameSite"] = same.capitalize()
@@ -638,9 +647,10 @@ def extract_links(html, base=None):
         seen.add(m)
         magnets.append({"url": m, "name": _dn(m) or "feed bundle"})
     attachments, seen_href = [], set()
-    for href, label in re.findall(
-            r'href="([^"]*(?:/attachments/)[^"]*)"[^>]*>(.*?)</a>',
+    for href, href_sq, label in re.findall(
+            r'''href=(?:"([^"]*(?:/attachments/)[^"]*)"|'([^']*(?:/attachments/)[^']*)')[^>]*>(.*?)</a>''',
             text, re.I | re.S):
+        href = href or href_sq
         href = urllib.parse.urljoin(base, href.replace("&amp;", "&"))
         if href in seen_href:
             continue

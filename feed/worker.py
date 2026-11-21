@@ -55,7 +55,6 @@ CONF = (os.environ.get("ADDONSYNC_CONFIG") or
 STATE = os.path.join(STATE_DIR, "state.json")
 LOCK = os.path.join(STATE_DIR, "lock")
 STAGE = os.path.join(STATE_DIR, "stage")
-CACHE = os.path.join(STATE_DIR, "cache")
 LOG = os.path.join(STATE_DIR, "worker.log")
 DEF_PUBLISH = os.path.join(STATE_DIR, "publish")
 DEF_INCOMING = os.path.join(STATE_DIR, "incoming")
@@ -353,10 +352,15 @@ def fetch_browser(cfg):
     for a in raw.get("attachments", []):
         url = a.get("url") or ""
         name = a.get("name") or ""
-        flavor, ver = parse_release(name) or parse_release(url)
+        flavor, ver = parse_release(name)
+        if not flavor:
+            flavor, ver = parse_release(url)
         if flavor:
             items.append({"flavor": flavor, "version": ver, "url": url,
                           "name": name, "kind": "http"})
+        else:
+            bundles.append({"flavor": None, "version": "", "url": url,
+                            "name": name or "attachment", "kind": "http"})
     fingerprint = hashlib.sha256(
         ("\n".join(sorted(info_hash(m.get("url") or "")
                            for m in raw.get("magnets", []))) + "\n" +
@@ -415,7 +419,7 @@ def fetch_feed(cfg):
 
 # ---------------------------------------------------------------- download
 
-ARCHIVE_RE = re.compile(r"\.(rar|zip|7z|torrent)$", re.I)
+ARCHIVE_RE = re.compile(r"\.(rar|zip|7z)$", re.I)
 _ARCHIVE_NAME = re.compile(PRESET.get("archive_pattern") or "", re.I) \
     if PRESET.get("archive_pattern") else None
 
@@ -435,8 +439,7 @@ def downloader_cfg(cfg):
     watch = d.get("watch_dir") or os.path.join(STATE_DIR, "magnets")
     completed = d.get("completed_dir") or incoming
     try:
-        timeout = float(d.get("timeout_min")
-                        or cfg.get("job_timeout_min", 120))
+        timeout = float(d.get("timeout_min") or 120)
     except (TypeError, ValueError):
         timeout = 120
     return {"method": method, "watch_dir": watch, "completed_dir": completed,
@@ -524,16 +527,43 @@ def cookie_matches(domain, host):
     return bool(d and host and (host == d or host.endswith("." + d)))
 
 
+def _download_name(url, response):
+    """A filename with an archive extension for a download.
+
+    Forum attachments often hide behind opaque URLs (/attachments/12345/),
+    which would otherwise save extensionless and be skipped later as
+    unidentifiable. Prefer the server's Content-Disposition filename, then
+    the URL tail, then sniff the Content-Type; never return bare.
+    """
+    cands = []
+    disp = response.headers.get("Content-Disposition") or ""
+    m = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", disp, re.I)
+    if m:
+        cands.append(urllib.parse.unquote(m.group(1).strip().strip('"')))
+    cands.append(os.path.basename(urllib.parse.urlparse(url).path))
+    for raw in cands:
+        name = re.sub(r"[^A-Za-z0-9._ -]+", "_",
+                      urllib.parse.unquote(raw or ""))
+        if name and archive_matches(name):
+            return name
+    ctype = response.headers.get_content_type()
+    ext = {"application/zip": ".zip",
+           "application/x-rar-compressed": ".rar",
+           "application/vnd.rar": ".rar",
+           "application/x-7z-compressed": ".7z"}.get(ctype, ".rar")
+    base = re.sub(r"[^A-Za-z0-9._ -]+", "_",
+                  urllib.parse.unquote(cands[-1] or "download")) or "download"
+    return base + ext
+
+
 def http_download(url, cfg, dest_dir):
     """Direct download; uses the browser session when the host needs it."""
     host = page_host(cfg)
     cookies = [c for c in browser_cookies()
                if cookie_matches(c.get("domain"), host)]
-    name = os.path.basename(urllib.parse.urlparse(url).path) or "download.rar"
-    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", urllib.parse.unquote(name))
-    dest = os.path.join(dest_dir, name)
-    tmp = dest + ".part"
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": cfg["thread_url"]}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if cfg.get("thread_url"):
+        headers["Referer"] = cfg["thread_url"]
     if cookies:
         headers["Cookie"] = "; ".join(
             "%s=%s" % (c["name"], c["value"]) for c in cookies)
@@ -541,6 +571,8 @@ def http_download(url, cfg, dest_dir):
     try:
         with urllib.request.urlopen(req,
                                     timeout=cfg.get("request_timeout", 40)) as r:
+            dest = os.path.join(dest_dir, _download_name(url, r))
+            tmp = dest + ".part"
             with open(tmp, "wb") as fh:
                 shutil.copyfileobj(r, fh)
     except urllib.error.HTTPError as exc:
@@ -788,9 +820,9 @@ def import_archive(path, cfg, st, force=False):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _record_import_error(st, what, exc):
-    log("import %s failed: %s" % (what, exc))
-    msg = "%s: %s" % (what, exc)
+def _record_import_error(st, what, exc, verb="import"):
+    log("%s %s failed: %s" % (verb, what, exc))
+    msg = "%s %s: %s" % (verb, what, exc)
     st["last_error"] = ("%s; %s" % (st["last_error"], msg)
                         if st.get("last_error") else msg)
 
@@ -836,21 +868,33 @@ def build_manifest(cfg, st):
 
 # ---------------------------------------------------------------- run
 
+def _try_lock():
+    """Take the cross-process check lock. Returns (locked, fh).
+
+    (False, fh) when another check or import holds it. Where fcntl is
+    missing (Windows) there is no lock to take; the caller proceeds, and
+    the README says so. Callers close fh exactly once.
+    """
+    fh = open(LOCK, "w")
+    if fcntl is None:
+        return False, fh
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False, fh
+    return True, fh
+
+
 def run_check(force=False, triggered=False):
     cfg = config()
     incoming = incoming_dir(cfg)
-    for d in (STATE_DIR, STAGE, CACHE, incoming, publish_dir(cfg)):
+    for d in (STATE_DIR, STAGE, incoming, publish_dir(cfg)):
         os.makedirs(d, exist_ok=True)
-    lock_fh = open(LOCK, "w")
-    locked = True
-    if fcntl is not None:
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            log("another check is running; skipping")
-            return {"ok": False, "error": "busy"}
-    else:
-        locked = False
+    locked, lock_fh = _try_lock()
+    if fcntl is not None and not locked:
+        log("another check is running; skipping")
+        lock_fh.close()
+        return {"ok": False, "error": "busy"}
 
     st = state()
     now = int(time.time())
@@ -888,22 +932,31 @@ def run_check(force=False, triggered=False):
             current = st["flavors"].get(flavor, {}).get("version")
             if not force and ver and not newer(ver, current):
                 continue
-            if item["kind"] == "magnet":
-                archives += enqueue_magnet(item["url"], cfg)
-            elif item["kind"] == "http":
-                archives.append(http_download(item["url"], cfg, incoming))
-            elif item["kind"] == "missing":
-                log("no link for %s %s" % (flavor, ver))
+            try:
+                if item["kind"] == "magnet":
+                    archives += enqueue_magnet(item["url"], cfg)
+                elif item["kind"] == "http":
+                    archives.append(http_download(item["url"], cfg, incoming))
+                elif item["kind"] == "missing":
+                    log("no link for %s %s" % (flavor, ver))
+            except Exception as exc:
+                _record_import_error(st, "%s %s" % (flavor, ver), exc,
+                                     verb="download")
 
         # bundle magnets: download only when the info hash is new
         for bundle in feed["bundles"]:
             h = info_hash(bundle["url"])
             if not force and h in st["seen_magnets"]:
                 continue
-            if bundle["kind"] == "magnet":
-                archives += enqueue_magnet(bundle["url"], cfg)
-            else:
-                archives.append(http_download(bundle["url"], cfg, incoming))
+            try:
+                if bundle["kind"] == "magnet":
+                    archives += enqueue_magnet(bundle["url"], cfg)
+                else:
+                    archives.append(http_download(bundle["url"], cfg, incoming))
+            except Exception as exc:
+                _record_import_error(st, bundle.get("name") or h, exc,
+                                     verb="download")
+                continue
             st["seen_magnets"] = (st["seen_magnets"] + [h])[-20:]
             save_state(st)
 
@@ -915,8 +968,12 @@ def run_check(force=False, triggered=False):
                         if archive_matches(n)]
 
         archives = [p for p in archives if os.path.exists(p)]
+        fetch_errors = st.get("last_error") or ""
         st["last_error"] = ""
         done = import_archives(archives, cfg, st, force=force)
+        if fetch_errors:
+            st["last_error"] = (fetch_errors + "; " + st["last_error"]
+                                if st["last_error"] else fetch_errors)
         build_manifest(cfg, st)
         failed = st["last_error"]
         if not failed:
@@ -950,21 +1007,31 @@ def import_from_downloads(force=False):
     incoming = incoming_dir(cfg)
     for d in (STATE_DIR, STAGE, publish_dir(cfg)):
         os.makedirs(d, exist_ok=True)
-    st = state()
-    paths = []
-    for name in os.listdir(incoming):
-        if archive_matches(name):
-            paths.append(os.path.join(incoming, name))
-    st["last_error"] = ""
-    done = import_archives(paths, cfg, st, force=force)
-    build_manifest(cfg, st)
-    if not st["last_error"]:
-        st["last_ok"] = int(time.time())
-    save_state(st)
-    out = {"ok": not st["last_error"], "updated": done}
-    if st["last_error"]:
-        out["error"] = st["last_error"]
-    return out
+    locked, lock_fh = _try_lock()
+    if fcntl is not None and not locked:
+        log("another check is running; skipping import")
+        lock_fh.close()
+        return {"ok": False, "error": "busy"}
+    try:
+        st = state()
+        paths = []
+        for name in os.listdir(incoming):
+            if archive_matches(name):
+                paths.append(os.path.join(incoming, name))
+        st["last_error"] = ""
+        done = import_archives(paths, cfg, st, force=force)
+        build_manifest(cfg, st)
+        if not st["last_error"]:
+            st["last_ok"] = int(time.time())
+        save_state(st)
+        out = {"ok": not st["last_error"], "updated": done}
+        if st["last_error"]:
+            out["error"] = st["last_error"]
+        return out
+    finally:
+        if locked:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        lock_fh.close()
 
 
 # ---------------------------------------------------------------- status

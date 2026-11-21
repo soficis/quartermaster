@@ -289,7 +289,7 @@ function Read-PublishManifest([string]$Base) {
   }
   $url = "$Base/manifest.json"
   try {
-    return Invoke-RestMethod -Uri $url -TimeoutSec 30
+    return Invoke-RestMethod -Uri $url -TimeoutSec 30 -UseBasicParsing
   } catch {
     Write-Log "ERROR: cannot read $url : $($_.Exception.Message)"
     return $null

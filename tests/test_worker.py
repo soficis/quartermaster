@@ -329,7 +329,6 @@ class RunCheckTests(unittest.TestCase):
                             ("STATE", os.path.join(self.tmp, "state.json")),
                             ("LOCK", os.path.join(self.tmp, "lock")),
                             ("STAGE", os.path.join(self.tmp, "stage")),
-                            ("CACHE", os.path.join(self.tmp, "cache")),
                             ("LOG", os.path.join(self.tmp, "worker.log"))):
             p = mock.patch.object(worker, name, value)
             p.start()
@@ -368,6 +367,130 @@ class RunCheckTests(unittest.TestCase):
             out = worker.run_check(force=True)
         self.assertTrue(out["ok"], out)
         self.assertFalse(worker.state()["needs_login"])
+
+    def test_one_bad_bundle_does_not_abort_the_check(self):
+        bad = {"kind": "magnet", "url": "magnet:?xt=urn:btih:BAD",
+               "name": "bad bundle"}
+        good = {"kind": "http", "url": "https://forum.example.com/g.zip",
+                "name": "good bundle"}
+        gone = os.path.join(self.tmp, "g.txt")  # dropped: not an archive
+        with mock.patch.object(worker, "fetch_feed",
+                               return_value=self._feed(bundles=[bad, good])), \
+                mock.patch.object(worker, "enqueue_magnet",
+                                  side_effect=RuntimeError("boom")), \
+                mock.patch.object(worker, "http_download",
+                                  return_value=gone) as dl:
+            out = worker.run_check(force=True)
+        dl.assert_called_once_with(good["url"], mock.ANY, mock.ANY)
+        self.assertFalse(out["ok"])
+        self.assertIn("bad bundle", worker.state()["last_error"])
+
+    def test_one_bad_item_does_not_abort_the_check(self):
+        bad = {"flavor": "retail", "version": "11.2.0",
+               "url": "magnet:?xt=urn:btih:BAD", "kind": "magnet",
+               "name": "bad"}
+        good = {"flavor": "classic", "version": "1.15.5",
+                "url": "https://forum.example.com/g.zip", "kind": "http",
+                "name": "good"}
+        gone = os.path.join(self.tmp, "g.txt")  # dropped: not an archive
+        with mock.patch.object(worker, "fetch_feed",
+                               return_value=self._feed(items=[bad, good])), \
+                mock.patch.object(worker, "enqueue_magnet",
+                                  side_effect=RuntimeError("boom")), \
+                mock.patch.object(worker, "http_download",
+                                  return_value=gone) as dl:
+            out = worker.run_check(force=True)
+        dl.assert_called_once_with(good["url"], mock.ANY, mock.ANY)
+        self.assertFalse(out["ok"])
+        self.assertIn("retail 11.2.0", worker.state()["last_error"])
+
+    @unittest.skipIf(worker.fcntl is None, "no fcntl on Windows")
+    def test_import_refuses_while_a_check_holds_the_lock(self):
+        locked, fh = worker._try_lock()
+        self.assertTrue(locked)
+        try:
+            out = worker.import_from_downloads()
+        finally:
+            worker.fcntl.flock(fh, worker.fcntl.LOCK_UN)
+            fh.close()
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"], "busy")
+
+
+class FetchBrowserTests(unittest.TestCase):
+    def _fetch(self, raw):
+        fake = mock.Mock()
+        fake.read_feed.return_value = raw
+        with mock.patch.dict(sys.modules, {"reader": fake}):
+            return worker.fetch_browser({})
+
+    def test_url_fallback_classifies_opaque_names(self):
+        # The label carries no release but the URL does. (None, None) is
+        # truthy, so `parse_release(name) or parse_release(url)` could never
+        # fall through to the URL; the two-step form does.
+        raw = {"magnets": [],
+               "attachments": [{
+                   "url": "https://forum.example.com/forum/attachments/"
+                          "Demo.Release.Retail.11.2.0.zip?id=5",
+                   "name": "download"}]}
+        feed = self._fetch(raw)
+        self.assertEqual([(i["flavor"], i["version"]) for i in feed["items"]],
+                         [("retail", "11.2.0")])
+
+    def test_unclassified_attachments_become_bundles(self):
+        raw = {"magnets": [],
+               "attachments": [{
+                   "url": "https://forum.example.com/forum/attachments/9",
+                   "name": "misc files"}]}
+        feed = self._fetch(raw)
+        self.assertEqual(feed["items"], [])
+        self.assertEqual(len(feed["bundles"]), 1)
+        self.assertEqual(feed["bundles"][0]["kind"], "http")
+
+
+class HttpDownloadNamingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="addonsync-dl-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _dl(self, url, headers):
+        from email.message import Message
+        msg = Message()
+        for key, value in headers.items():
+            msg[key] = value
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.close()
+
+        resp = Resp(b"fake-archive-bytes")
+        resp.headers = msg
+        with mock.patch.object(worker, "browser_cookies", return_value=[]), \
+                mock.patch.object(worker.urllib.request, "urlopen",
+                                  return_value=resp):
+            return worker.http_download(url, {}, self.tmp)
+
+    def test_content_disposition_names_opaque_urls(self):
+        dest = self._dl("https://forum.example.com/forum/attachments/12345/",
+                        {"Content-Disposition":
+                         'attachment; filename="Demo Release Retail 11.2.0.zip"'})
+        self.assertTrue(worker.archive_matches(os.path.basename(dest)))
+        self.assertTrue(dest.endswith("Demo Release Retail 11.2.0.zip"))
+        self.assertTrue(os.path.isfile(dest))
+
+    def test_content_type_sniffs_extension_when_nameless(self):
+        dest = self._dl("https://forum.example.com/forum/attachments/Demo12345",
+                        {"Content-Type": "application/zip"})
+        self.assertTrue(dest.endswith(".zip"))
+        self.assertTrue(worker.archive_matches(os.path.basename(dest)))
+
+    def test_plain_url_tail_is_kept(self):
+        dest = self._dl("https://cdn.example.com/Demo.Release.Retail.11.2.0.zip",
+                        {"Content-Type": "application/octet-stream"})
+        self.assertTrue(dest.endswith("Demo.Release.Retail.11.2.0.zip"))
 
 
 if __name__ == "__main__":
