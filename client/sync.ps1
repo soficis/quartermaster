@@ -92,7 +92,9 @@ $cfgPath = if ($Config) { $Config } else { Join-Path $here "sync.config.json" }
 $whatIfWas = $WhatIfPreference
 $WhatIfPreference = $false
 if (Test-Path -LiteralPath $cfgPath) {
-  $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
+  # -Encoding UTF8 reads BOM and BOM-less UTF-8 alike; 5.1's default (ANSI)
+  # garbles a non-ASCII root saved by Notepad, and the root is then "missing".
+  $cfg = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
   foreach ($name in $defaults.Keys) {
     if ($PSBoundParameters.ContainsKey($name)) { continue }
     if ($name -eq "ActiveWithinDays" -and $ActiveWithinDays -ge 0) { continue }
@@ -120,18 +122,22 @@ $FlavorDirs = @{
 }
 
 function Write-Log([string]$Message) {
+  # Local shadow, before anything touches disk: -WhatIf must still produce a
+  # log to review afterwards, and on a clean machine that means creating the
+  # log folder too.
+  $WhatIfPreference = $false
   $line = "{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
   $dir = Split-Path -Parent $LogPath
-  if ($dir -and !(Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-  # Local shadow: -WhatIf must still produce a log to review afterwards.
-  $WhatIfPreference = $false
+  if ($dir -and !(Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
   Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
   Write-Host $line
 }
 
 function ConvertTo-Version([string]$Text) {
   if (!$Text) { return @() }
-  return @([regex]::Matches($Text, "\d+") | ForEach-Object { [int]$_.Value })
+  # [long], not [int]: a date-stamped part (2026112101) overflows Int32 and
+  # would throw outside any try; Python's version_tuple has no limit.
+  return @([regex]::Matches($Text, "\d+") | ForEach-Object { [long]$_.Value })
 }
 
 function Test-Newer([string]$Candidate, [string]$Current) {
@@ -148,12 +154,17 @@ function Test-Newer([string]$Candidate, [string]$Current) {
   return $false
 }
 
-function Get-LocalVersion([string]$AddonPath) {
+function Get-MarkerVersion([string]$AddonPath) {
+  # The version a previous sync installed; "" when unmanaged. An empty or
+  # unreadable marker counts as unmanaged instead of ending the whole run.
   $marker = Join-Path $AddonPath ".synced-version"
-  if (Test-Path $marker) {
-    $v = (Get-Content -LiteralPath $marker -TotalCount 1).Trim()
-    if ($v) { return $v }
+  if (Test-Path -LiteralPath $marker) {
+    return ("" + (Get-Content -LiteralPath $marker -TotalCount 1 -ErrorAction SilentlyContinue)).Trim()
   }
+  return ""
+}
+
+function Get-TocVersion([string]$AddonPath) {
   $toc = Get-ChildItem -LiteralPath $AddonPath -Filter "*.toc" -ErrorAction SilentlyContinue |
     Select-Object -First 1
   if ($toc) {
@@ -202,6 +213,25 @@ function Get-LastPlay([string]$WtfPath) {
     # file mtimes move when it rewrites configs. Either signals play.
     Get-ChildItem -LiteralPath $WtfPath -ErrorAction SilentlyContinue |
       ForEach-Object { if ($_.LastWriteTime -gt $best) { $best = $_.LastWriteTime } }
+    # A session that changes no setting may leave the top level alone, but
+    # logging out rewrites SavedVariables (account and per character) and the
+    # account's *-cache.wtf files. Bounded: Account/<a>[/<realm>/<char>].
+    $paths = @()
+    foreach ($a in @(Get-ChildItem -LiteralPath (Join-Path $WtfPath "Account") -Directory -ErrorAction SilentlyContinue)) {
+      $paths += @(Get-ChildItem -LiteralPath $a.FullName -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+      $paths += Join-Path $a.FullName "SavedVariables"
+      foreach ($realm in @(Get-ChildItem -LiteralPath $a.FullName -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne "SavedVariables" })) {
+        foreach ($char in @(Get-ChildItem -LiteralPath $realm.FullName -Directory -ErrorAction SilentlyContinue)) {
+          $paths += Join-Path $char.FullName "SavedVariables"
+        }
+      }
+    }
+    foreach ($p in $paths) {
+      if (Test-Path -LiteralPath $p) {
+        $t = (Get-Item -LiteralPath $p).LastWriteTime
+        if ($t -gt $best) { $best = $t }
+      }
+    }
   }
   return $best
 }
@@ -240,11 +270,18 @@ function Invoke-Download([string]$Url, [string]$Destination) {
 
 # ---------------------------------------------------------------- main
 
+function Test-HttpBase([string]$Base) { return $Base -match '^https?://' }
+
 function Read-PublishManifest([string]$Base) {
-  if (Test-Path -LiteralPath $Base) {
+  if (!(Test-HttpBase $Base)) {
+    # A folder or share. When it is down, say so; do not retry it as a URL.
     $file = Join-Path $Base "manifest.json"
+    if (!(Test-Path -LiteralPath $Base)) {
+      Write-Log "ERROR: publish folder not reachable: $Base"
+      return $null
+    }
     try {
-      return Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+      return Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
       Write-Log "ERROR: cannot read $file : $($_.Exception.Message)"
       return $null
@@ -261,12 +298,19 @@ function Read-PublishManifest([string]$Base) {
 
 function Get-FlavorZip([string]$Base, [string]$Flavor, [string]$Name,
   [string]$Destination) {
-  if (Test-Path -LiteralPath $Base) {
+  if (!(Test-HttpBase $Base)) {
     Copy-Item -LiteralPath (Join-Path $Base "$Flavor/$Name") `
       -Destination $Destination -Force
     return
   }
-  Invoke-Download "$Base/$Flavor/$Name" $Destination
+  $url = "{0}/{1}/{2}" -f $Base, [uri]::EscapeDataString($Flavor), [uri]::EscapeDataString($Name)
+  Invoke-Download $url $Destination
+}
+
+function Test-LeafName($Value) {
+  # addon and zip are joined onto local paths: a bare file name only.
+  $s = "$Value"
+  return $s -and $s -ne "." -and $s -ne ".." -and ([IO.Path]::GetFileName($s) -eq $s)
 }
 
 Write-Log "=== addon sync start (from $ManifestBase) ==="
@@ -274,6 +318,20 @@ $manifest = Read-PublishManifest $ManifestBase
 if (!$manifest -or !$manifest.flavors) {
   Write-Log "ERROR: no flavors in the manifest"
   exit 1
+}
+
+# The five built-in flavors keep their order; a preset may publish more, each
+# carrying its client folder as wow_dir. Without this, an extra flavor would
+# be published and silently never installed.
+foreach ($p in @($manifest.flavors.PSObject.Properties)) {
+  $wowDir = "$($p.Value.wow_dir)"
+  if ($wowDir -and !$FlavorDirs.ContainsKey($wowDir) -and !($FlavorDirs.Values -contains $p.Name)) {
+    $FlavorDirs[$wowDir] = $p.Name
+  }
+  if ($FlavorOrder -notcontains $p.Name) {
+    if ($FlavorDirs.Values -contains $p.Name) { $FlavorOrder += $p.Name }
+    else { Write-Log ("note: flavor {0} has no wow_dir in the manifest; skipped" -f $p.Name) }
+  }
 }
 
 $found = @(Get-WowTargets)
@@ -294,18 +352,43 @@ if ($targets.Count -eq 0) {
 Write-Log ("targets: " + (($targets | ForEach-Object { "$($_.Flavor)@$($_.AddOns)" }) -join "; "))
 
 $changed = 0
+$failed = 0
 foreach ($flavor in $FlavorOrder) {
   $entry = $manifest.flavors.$flavor
   if (!$entry) { continue }
   $mine = @($targets | Where-Object { $_.Flavor -eq $flavor })
   if ($mine.Count -eq 0) { continue }
 
+  # The publisher always writes these; anything else is a broken or
+  # hand-edited manifest, and installing from it would skip verification.
+  $bad = @()
+  if (!(Test-LeafName $entry.addon)) { $bad += "addon" }
+  if (!(Test-LeafName $entry.zip)) { $bad += "zip" }
+  if (!"$($entry.version)") { $bad += "version" }
+  if ("$($entry.sha256)" -notmatch '^[0-9a-fA-F]{64}$') { $bad += "sha256" }
+  if ($bad.Count) {
+    Write-Log ("ERROR: {0}: manifest entry has a missing or invalid {1}; not installing" -f $flavor, ($bad -join ", "))
+    $failed += $mine.Count
+    continue
+  }
+
   foreach ($target in $mine) {
     $addonPath = Join-Path $target.AddOns $entry.addon
-    $local = Get-LocalVersion $addonPath
-    if (!$Force -and !(Test-Newer $entry.version $local)) {
-      Write-Log ("{0}: up to date ({1}) at {2}" -f $flavor, $local, $target.AddOns)
-      continue
+    $local = Get-MarkerVersion $addonPath
+    if ($local) {
+      if (!$Force -and !(Test-Newer $entry.version $local)) {
+        Write-Log ("{0}: up to date ({1}) at {2}" -f $flavor, $local, $target.AddOns)
+        continue
+      }
+    } elseif (!$Force) {
+      # Not installed by a sync. The toc often carries only major.minor
+      # ("11.2" vs "11.2.0" compare equal), so equal means "take it over";
+      # only a strictly newer hand-installed copy is left alone.
+      $tocVersion = Get-TocVersion $addonPath
+      if ($tocVersion -and (Test-Newer $tocVersion $entry.version)) {
+        Write-Log ("{0}: local copy {1} is newer than {2}; leaving it at {3}" -f $flavor, $tocVersion, $entry.version, $target.AddOns)
+        continue
+      }
     }
     $label = "{0} {1} -> {2} ({3})" -f $flavor, $entry.version, $target.AddOns, $target.Root
     if (!$PSCmdlet.ShouldProcess($target.AddOns, "install $($entry.addon) $($entry.version)")) {
@@ -318,7 +401,7 @@ foreach ($flavor in $FlavorOrder) {
     try {
       Get-FlavorZip $ManifestBase $flavor $entry.zip $tmpZip
       $hash = (Get-FileHash -LiteralPath $tmpZip -Algorithm SHA256).Hash.ToLower()
-      if ($entry.sha256 -and $hash -ne $entry.sha256.ToLower()) {
+      if ($hash -ne "$($entry.sha256)".ToLower()) {
         throw "sha256 mismatch (got $hash, expected $($entry.sha256))"
       }
       New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
@@ -333,29 +416,43 @@ foreach ($flavor in $FlavorOrder) {
         Write-Log ("note: zip folder is {0}, expected {1}; using the zip" -f (Split-Path -Leaf $src), $entry.addon)
       }
 
-      $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+      # Unique per target: two installs of one flavor updated in the same
+      # second must not share (and nest inside) one backup folder. The name
+      # still sorts by time for the prune below.
+      $stamp = "{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss"), [guid]::NewGuid().ToString("N").Substring(0, 6)
       $backup = Join-Path $BackupDir ("AddOns/{0}/{1}" -f $flavor, $stamp)
-      if (Test-Path -LiteralPath $addonPath) {
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backup) | Out-Null
-        Move-Item -LiteralPath $addonPath -Destination $backup -Force
-        Write-Log "backup: $backup"
-      }
-
+      $movedAway = $false
       try {
+        if (Test-Path -LiteralPath $addonPath) {
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backup) | Out-Null
+          Move-Item -LiteralPath $addonPath -Destination $backup -Force
+          $movedAway = $true
+          Write-Log "backup: $backup"
+        }
         Copy-Item -LiteralPath $src -Destination $addonPath -Recurse -Force
         Set-Content -LiteralPath (Join-Path $addonPath ".synced-version") `
           -Value $entry.version -Encoding ASCII
       } catch {
-        Remove-Item -LiteralPath $addonPath -Recurse -Force -ErrorAction SilentlyContinue
-        if (Test-Path -LiteralPath $backup) {
-          Move-Item -LiteralPath $backup -Destination $addonPath -Force
-          Write-Log "restored previous addon after a failed copy"
+        $why = $_
+        if ($movedAway) {
+          # Clear the half-copied folder first; if that fails, moving the
+          # backup "onto" it would nest it inside instead of restoring it.
+          if (Test-Path -LiteralPath $addonPath) {
+            Remove-Item -LiteralPath $addonPath -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if (Test-Path -LiteralPath $addonPath) {
+            Write-Log "ERROR: could not clear $addonPath; previous addon left at $backup"
+          } else {
+            Move-Item -LiteralPath $backup -Destination $addonPath -Force
+            Write-Log "restored previous addon after a failed install"
+          }
         }
-        throw
+        throw $why
       }
       $changed++
       Write-Log "installed: $label"
     } catch {
+      $failed++
       Write-Log "ERROR: $label : $($_.Exception.Message)"
     } finally {
       Remove-Item -LiteralPath $tmpZip -Force -ErrorAction SilentlyContinue
@@ -374,5 +471,10 @@ foreach ($flavor in $FlavorDirs.Values | Select-Object -Unique) {
     ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+if ($failed) {
+  # Non-zero so Task Scheduler / systemd show the failure, not just the log.
+  Write-Log "=== addon sync done: $changed installed, $failed FAILED ==="
+  exit 1
+}
 Write-Log "=== addon sync done: $changed installed ==="
 exit 0

@@ -43,13 +43,14 @@ function Write-Utf8([string]$Path, [string]$Text) {
   [IO.File]::WriteAllText($Path, $Text, $enc)
 }
 
-function New-Publish([string]$Version, [string]$Sha = "", [bool]$Corrupt = $false) {
+function New-Publish([string]$Version, [string]$Sha = "", [bool]$Corrupt = $false,
+  [string]$Flavor = "retail", [string]$WowDir = "") {
   Remove-Item -LiteralPath $src -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Force -Path $src | Out-Null
   Write-Utf8 (Join-Path $src "DemoAddon.toc") "## Interface: 110200`n## Version: $Version`n"
   Write-Utf8 (Join-Path $src "core.lua") "-- version $Version`n"
 
-  $flavorDir = Join-Path $publish "retail"
+  $flavorDir = Join-Path $publish $Flavor
   New-Item -ItemType Directory -Force -Path $flavorDir | Out-Null
   $zipName = "DemoAddon-$Version.zip"
   $zip = Join-Path $flavorDir $zipName
@@ -67,21 +68,27 @@ function New-Publish([string]$Version, [string]$Sha = "", [bool]$Corrupt = $fals
     size    = (Get-Item -LiteralPath $zip).Length
     source  = "smoke"
   }
+  if ($WowDir) { $entry.wow_dir = $WowDir }
+  if ($Sha -eq "omit") { $entry.Remove("sha256") }
   $manifest = [ordered]@{
     generated = [int](New-TimeSpan -Start ([datetime]"1970-01-01") -End (Get-Date)).TotalSeconds
-    flavors   = @{ retail = $entry }
+    flavors   = @{ $Flavor = $entry }
   }
   Write-Utf8 (Join-Path $publish "manifest.json") ($manifest | ConvertTo-Json -Depth 6)
 }
 
-function Invoke-Sync([string[]]$Extra = @()) {
+function Invoke-Sync([string[]]$Extra = @(), [string]$Cfg = $cfgPath) {
+  # Under 5.1, child stderr captured with 2>&1 becomes an error record; with
+  # "Stop" that would abort the whole suite instead of failing one check.
+  $ErrorActionPreference = "Continue"
   $out = & $hostExe -NoProfile -ExecutionPolicy Bypass -File $sync `
-    -Config $cfgPath @Extra 2>&1
+    -Config $Cfg @Extra 2>&1
   [pscustomobject]@{ Code = $LASTEXITCODE; Output = (@($out) -join "`n") }
 }
 
 function Read-Text([string]$Path) {
-  if (Test-Path -LiteralPath $Path) { return (Get-Content -LiteralPath $Path -Raw) }
+  # "" + : -Raw returns $null for an empty file, and checks call .Trim().
+  if (Test-Path -LiteralPath $Path) { return "" + (Get-Content -LiteralPath $Path -Raw) }
   return ""
 }
 
@@ -126,6 +133,97 @@ try {
   $r = Invoke-Sync
   Check ((Read-Text $logPath) -match "sha256 mismatch") "bad hash is reported"
   Check ((Read-Text $marker).Trim() -eq "11.2.1") "bad hash leaves the working addon"
+  Check ($r.Code -ne 0) "a failed install exits non-zero"
+
+  # -WhatIf on a clean machine: the log folder does not exist yet.
+  New-Publish "11.2.3"
+  $backupDir = Join-Path $backup "AddOns/retail"
+  $before = @(Get-ChildItem -LiteralPath $backupDir -Directory).Count
+  $freshLog = Join-Path $root "fresh/logs/sync.log"
+  $r = Invoke-Sync @("-WhatIf", "-LogPath", $freshLog)
+  Check ($r.Code -eq 0) "whatif exits 0 when the log folder is missing"
+  Check ((Read-Text $freshLog) -match "WHATIF: retail 11.2.3") "whatif creates and writes the log"
+  Check (@(Get-ChildItem -LiteralPath $backupDir -Directory).Count -eq $before) "whatif keeps every backup"
+  Check ((Read-Text $marker).Trim() -eq "11.2.1") "whatif leaves the addon alone"
+
+  # A manifest entry without a sha256 is refused, not installed blind.
+  New-Publish "11.2.4" -Sha "omit"
+  $r = Invoke-Sync
+  Check ($r.Code -ne 0) "missing sha256 exits non-zero"
+  Check ((Read-Text $logPath) -match "invalid sha256") "missing sha256 is reported"
+  Check ((Read-Text $marker).Trim() -eq "11.2.1") "missing sha256 installs nothing"
+
+  # An empty marker is "unmanaged", not a crash of the whole run.
+  Write-Utf8 $marker ""
+  New-Publish "11.2.5"
+  $r = Invoke-Sync
+  Check ($r.Code -eq 0) "an empty marker does not end the run"
+  Check ((Read-Text $marker).Trim() -eq "11.2.5") "an empty marker is replaced"
+
+  # Hand-installed copy, no marker: a major.minor toc equal to the release
+  # is taken over; a strictly newer one is left alone.
+  New-Publish "11.2.0"
+  Remove-Item -LiteralPath $addonPath -Recurse -Force
+  New-Item -ItemType Directory -Force -Path $addonPath | Out-Null
+  Write-Utf8 (Join-Path $addonPath "DemoAddon.toc") "## Version: 11.2`n"
+  $r = Invoke-Sync
+  Check ((Read-Text $marker).Trim() -eq "11.2.0") "toc 11.2 is taken over by 11.2.0"
+  Remove-Item -LiteralPath $addonPath -Recurse -Force
+  New-Item -ItemType Directory -Force -Path $addonPath | Out-Null
+  Write-Utf8 (Join-Path $addonPath "DemoAddon.toc") "## Version: 12.0`n"
+  $r = Invoke-Sync
+  Check (!(Test-Path -LiteralPath $marker)) "a newer hand-installed copy is left alone"
+
+  # Two installs of one flavor updated in the same run: separate backups.
+  $wowB = Join-Path $root "wowB"
+  $backup2 = Join-Path $root "backup2"
+  foreach ($w in @($wow, $wowB)) {
+    $a = Join-Path $w "_retail_/Interface/AddOns/DemoAddon"
+    Remove-Item -LiteralPath $a -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $a | Out-Null
+    Write-Utf8 (Join-Path $a ".synced-version") "1.0`n"
+    Write-Utf8 (Join-Path $a "owner.txt") (Split-Path -Leaf $w)
+  }
+  $cfg2 = Join-Path $root "sync2.config.json"
+  $c2 = [ordered]@{ ManifestBase = $publish; Roots = @($wow, $wowB); BackupDir = $backup2
+    LogPath = $logPath; ActiveWithinDays = 0 }
+  Write-Utf8 $cfg2 ($c2 | ConvertTo-Json -Depth 4)
+  New-Publish "11.3.0"
+  $r = Invoke-Sync -Cfg $cfg2
+  $b2 = @(Get-ChildItem -LiteralPath (Join-Path $backup2 "AddOns/retail") -Directory -ErrorAction SilentlyContinue)
+  $owners = @($b2 | ForEach-Object { (Read-Text (Join-Path $_.FullName "owner.txt")).Trim() } | Sort-Object)
+  Check ($r.Code -eq 0 -and $b2.Count -eq 2) "two installs of one flavor get two backups"
+  Check (($owners -join ",") -eq "wow,wowB") "each backup holds its own install"
+
+  # A flavor outside the built-in five installs through its wow_dir.
+  $wowP = Join-Path $root "wowP"
+  New-Item -ItemType Directory -Force -Path (Join-Path $wowP "_ptr_/Interface/AddOns") | Out-Null
+  $cfg3 = Join-Path $root "sync3.config.json"
+  $c3 = [ordered]@{ ManifestBase = $publish; Roots = @($wowP); Include = @("ptr")
+    BackupDir = $backup2; LogPath = $logPath }
+  Write-Utf8 $cfg3 ($c3 | ConvertTo-Json -Depth 4)
+  New-Publish "1.0.0" -Flavor "ptr" -WowDir "_ptr_"
+  $r = Invoke-Sync -Cfg $cfg3
+  Check ((Read-Text (Join-Path $wowP "_ptr_/Interface/AddOns/DemoAddon/.synced-version")).Trim() -eq "1.0.0") "an extra flavor installs via wow_dir"
+
+  # Activity: only SavedVariables moved recently; the top of WTF is old.
+  $wowL = Join-Path $root "wowL"
+  $wtf = Join-Path $wowL "_retail_/WTF"
+  $sv = Join-Path $wtf "Account/ACCT/Realm/Char/SavedVariables"
+  New-Item -ItemType Directory -Force -Path (Join-Path $wowL "_retail_/Interface/AddOns"), $sv | Out-Null
+  Write-Utf8 (Join-Path $wtf "Config.wtf") "SET x `"1`"`n"
+  $old = (Get-Date).AddDays(-90)
+  foreach ($p in @((Join-Path $wtf "Config.wtf"), (Join-Path $wtf "Account"), (Join-Path $wtf "Account/ACCT"),
+      (Join-Path $wtf "Account/ACCT/Realm"), (Join-Path $wtf "Account/ACCT/Realm/Char"), $wtf)) {
+    (Get-Item -LiteralPath $p).LastWriteTime = $old
+  }
+  $cfg4 = Join-Path $root "sync4.config.json"
+  $c4 = [ordered]@{ ManifestBase = $publish; Roots = @($wowL); BackupDir = $backup2
+    LogPath = $logPath; ActiveWithinDays = 30 }
+  Write-Utf8 $cfg4 ($c4 | ConvertTo-Json -Depth 4)
+  New-Publish "11.3.0"
+  $r = Invoke-Sync -Cfg $cfg4
+  Check (Test-Path -LiteralPath (Join-Path $wowL "_retail_/Interface/AddOns/DemoAddon/.synced-version")) "recent SavedVariables mark an install active"
 
   $setupCopy = Join-Path $root "client"
   New-Item -ItemType Directory -Force -Path $setupCopy | Out-Null
@@ -136,6 +234,17 @@ try {
   Check ($LASTEXITCODE -eq 0) "setup -NoSchedule exits 0"
   Check (Test-Path -LiteralPath $setupCfg) "setup writes the config"
   Check ((@($out) -join "`n") -match "no scheduler registered") "setup stops before the scheduler"
+
+  # Re-running Setup keeps the settings it does not ask about.
+  $kept = Get-Content -LiteralPath $setupCfg -Raw | ConvertFrom-Json
+  $kept | Add-Member -NotePropertyName Include -NotePropertyValue @("classic") -Force
+  $kept | Add-Member -NotePropertyName BackupDir -NotePropertyValue "D:\Backups" -Force
+  Write-Utf8 $setupCfg ($kept | ConvertTo-Json -Depth 4)
+  $out = & $hostExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $setupCopy "Setup.ps1") `
+    -ManifestBase $publish -Roots $wowB -Yes -NoSchedule 2>&1
+  $again = Get-Content -LiteralPath $setupCfg -Raw | ConvertFrom-Json
+  Check ((@($again.Include) -join ",") -eq "classic" -and $again.BackupDir -eq "D:\Backups") "setup rerun keeps Include and BackupDir"
+  Check ((@($again.Roots) -join ",") -eq $wowB) "setup rerun updates Roots"
 }
 finally {
   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
