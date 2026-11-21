@@ -29,6 +29,11 @@
     classic     -> _classic_   (+ any direct-client root, e.g. a 3.3.5 client)
     era         -> _classic_era_
 
+  A root is a parent with those folders, or one direct client. A direct root
+  uses -DirectFlavor (classic by default) unless the root folder itself is
+  named for a flavor. Roots are expanded ("~", %VARS%), duplicates removed,
+  and -Include/-Exclude accept either a flavor or a root path.
+
 .PARAMETER ActiveWithinDays
   WTF data newer than this many days marks the install active. 0 disables
   the activity check (every found install is targeted).
@@ -121,6 +126,34 @@ $FlavorDirs = @{
   "_classic_era_" = "era"
 }
 
+function Get-ResolvedPath([string]$Path) {
+  # Config files often carry "~/" on Unix-like systems or %VAR% on Windows.
+  # Expand them so a root typed by a user matches the path we log and the
+  # path -Include/-Exclude are compared against. Flavor names pass through
+  # unchanged; callers only use this for paths.
+  $s = "$Path".Trim()
+  if ($s -match '^~([\\/]|$)') {
+    $s = Join-Path $homeDir $s.Substring(1).TrimStart('\', '/')
+  }
+  if ($s -match '%') { $s = [Environment]::ExpandEnvironmentVariables($s) }
+  if (!$s) { return $s }
+  try { return [IO.Path]::GetFullPath($s) } catch { return $s }
+}
+
+# Canonical roots: no trailing separators, "~" and %VARS% expanded, duplicates
+# removed. Otherwise one install can be targeted twice, and Include/Exclude by
+# root path silently miss the target.
+$Roots = @($Roots | ForEach-Object { Get-ResolvedPath $_ } | Where-Object { $_ } |
+  Select-Object -Unique)
+
+function Test-ListMatch([string[]]$List, $Target) {
+  if ($List -contains $Target.Flavor) { return $true }
+  foreach ($item in $List) {
+    if ((Get-ResolvedPath $item) -eq $Target.Root) { return $true }
+  }
+  return $false
+}
+
 function Write-Log([string]$Message) {
   # Local shadow, before anything touches disk: -WhatIf must still produce a
   # log to review afterwards, and on a clean machine that means creating the
@@ -181,8 +214,12 @@ function Get-WowTargets {
     if (!(Test-Path -LiteralPath $root)) { continue }
     $direct = Join-Path $root "Interface/AddOns"
     if (Test-Path -LiteralPath $direct) {
+      # A client folder pointed at directly can name its own flavor
+      # (/.../_retail_ is retail, not the default direct flavor classic).
+      $leaf = Split-Path -Leaf $root
+      $flavor = if ($FlavorDirs.ContainsKey($leaf)) { $FlavorDirs[$leaf] } else { $DirectFlavor }
       $out += [pscustomobject]@{
-        Root = $root; Flavor = $DirectFlavor; AddOns = $direct
+        Root = $root; Flavor = $flavor; AddOns = $direct
         Wtf = Join-Path $root "WTF"
       }
       continue
@@ -245,8 +282,8 @@ function Test-Managed([string]$AddOns) {
 }
 
 function Test-TargetActive($Target) {
-  if ($Exclude -contains $Target.Flavor -or $Exclude -contains $Target.Root) { return $false }
-  if ($Include -contains $Target.Flavor -or $Include -contains $Target.Root) { return $true }
+  if (Test-ListMatch $Exclude $Target) { return $false }
+  if (Test-ListMatch $Include $Target) { return $true }
   if (Test-Managed $Target.AddOns) { return $true }
   if ($ActiveWithinDays -le 0) { return $true }
   $last = Get-LastPlay $Target.Wtf

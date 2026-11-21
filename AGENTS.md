@@ -23,8 +23,10 @@ shape"), verify it, and leave the user with a scheduled update.
 1. **Which shape?** Default to **A. One PC** unless they mention an
    always-on server, NAS, or Pi. Read the shape table to them, one line each.
 2. **Where is WoW?** Take the root(s): a folder with `Interface/AddOns`,
-   or a parent holding `_retail_`, `_classic_`, etc. Do not guess silently;
-   `client/Setup.ps1` prints per-OS guesses and marks which exist.
+   or a parent holding `_retail_`, `_classic_`, etc. Do not install into a
+   root the user did not name: `client/Setup.ps1` detects installs at the
+   per-OS guesses and asks which to add. It also expands `~/` and `%VARS%`
+   and accepts `-DirectFlavor` for a standalone client.
 3. **Which page?** The URL of the page that links the release archives. A
    login wall is fine: the reader drives a browser the user signs in to. Ask
    too for the addon folder name and the token the archive names start with.

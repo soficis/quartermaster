@@ -222,6 +222,83 @@ try {
   $r = Invoke-Sync -Cfg $cfg3
   Check ((Read-Text (Join-Path $wowP "_ptr_/Interface/AddOns/DemoAddon/.synced-version")).Trim() -eq "1.0.0") "an extra flavor installs via wow_dir"
 
+  # Install detection across platforms: one parent holding three clients, a
+  # direct client, a direct client whose folder name names its flavor, and a
+  # missing root. Paths with spaces catch unquoted native invocations. The
+  # duplicate root must not produce a second target for the same addons.
+  $multi = Join-Path $root "multi with space"
+  $direct = Join-Path $root "direct client"
+  $named = Join-Path $root "_retail_"
+  foreach ($d in @("_retail_", "_classic_", "_classic_era_")) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $multi "$d/Interface/AddOns") | Out-Null
+  }
+  New-Item -ItemType Directory -Force -Path (Join-Path $direct "Interface/AddOns"),
+    (Join-Path $named "Interface/AddOns") | Out-Null
+  $multiManifest = [ordered]@{ generated = 1; flavors = [ordered]@{} }
+  foreach ($spec in @(@("retail", "RetailAddon"), @("classic", "ClassicAddon"), @("era", "EraAddon"))) {
+    $flavor = $spec[0]; $addon = $spec[1]
+    $flavorSrc = Join-Path $root "detect-$flavor/$addon"
+    New-Item -ItemType Directory -Force -Path $flavorSrc | Out-Null
+    Write-Utf8 (Join-Path $flavorSrc "$addon.toc") "## Version: 1.0.0`n"
+    $flavorDir = Join-Path $publish $flavor
+    New-Item -ItemType Directory -Force -Path $flavorDir | Out-Null
+    $flavorZip = Join-Path $flavorDir "$addon-1.0.0.zip"
+    Compress-Archive -Path $flavorSrc -DestinationPath $flavorZip -Force
+    $multiManifest.flavors[$flavor] = [ordered]@{
+      addon = $addon; version = "1.0.0"; zip = "$addon-1.0.0.zip"
+      sha256 = (Get-FileHash -LiteralPath $flavorZip -Algorithm SHA256).Hash.ToLower()
+      size = (Get-Item -LiteralPath $flavorZip).Length; source = "smoke"
+    }
+  }
+  Write-Utf8 (Join-Path $publish "manifest.json") ($multiManifest | ConvertTo-Json -Depth 6)
+  $cfgDetect = Join-Path $root "detect.config.json"
+  $detectCfg = [ordered]@{
+    ManifestBase = $publish
+    Roots = @($multi, $direct, $named, (Join-Path $root "missing"), $multi)
+    Include = @("retail", "classic", "era")
+    BackupDir = (Join-Path $root "detect-backup"); LogPath = (Join-Path $root "detect.log")
+    ActiveWithinDays = 0
+  }
+  Write-Utf8 $cfgDetect ($detectCfg | ConvertTo-Json -Depth 4)
+  $r = Invoke-Sync -Cfg $cfgDetect
+  Check ($r.Code -eq 0) "multi-flavor detection exits 0"
+  $targetLine = (Read-Text (Join-Path $root "detect.log")) -split "`n" | Where-Object { $_ -match "targets:" } | Select-Object -Last 1
+  Check ((@($targetLine -split ";").Count -eq 5)) "duplicate roots produce one target each"
+  foreach ($spec in @(
+      @($multi, "_retail_", "RetailAddon"), @($multi, "_classic_", "ClassicAddon"),
+      @($multi, "_classic_era_", "EraAddon"), @($direct, "", "ClassicAddon"),
+      @($named, "", "RetailAddon"))) {
+    $markerPath = if ($spec[1]) {
+      Join-Path $spec[0] ("{0}/Interface/AddOns/{1}/.synced-version" -f $spec[1], $spec[2])
+    } else {
+      Join-Path $spec[0] ("Interface/AddOns/{0}/.synced-version" -f $spec[2])
+    }
+    Check (Test-Path -LiteralPath $markerPath) ("detected install writes {0}/{1}" -f $spec[1], $spec[2])
+  }
+  # A direct root can be told its flavor from the config, and "~/" expands.
+  $cfgDirect = Join-Path $root "direct.config.json"
+  $directCfg = [ordered]@{ ManifestBase = $publish; Roots = @($direct); DirectFlavor = "retail"
+    BackupDir = (Join-Path $root "direct-backup"); LogPath = (Join-Path $root "direct.log")
+    ActiveWithinDays = 0 }
+  Write-Utf8 $cfgDirect ($directCfg | ConvertTo-Json -Depth 4)
+  $r = Invoke-Sync -Cfg $cfgDirect
+  Check (Test-Path -LiteralPath (Join-Path $direct "Interface/AddOns/RetailAddon/.synced-version")) "DirectFlavor from config is honoured"
+
+  $homeName = ".addonsync-smoke-" + [guid]::NewGuid().ToString("N")
+  $homeRoot = Join-Path $HOME $homeName
+  try {
+    New-Item -ItemType Directory -Force -Path (Join-Path $homeRoot "_retail_/Interface/AddOns") | Out-Null
+    $cfgTilde = Join-Path $root "tilde.config.json"
+    $tildeCfg = [ordered]@{ ManifestBase = $publish; Roots = @("~/$homeName")
+      BackupDir = (Join-Path $root "tilde-backup"); LogPath = (Join-Path $root "tilde.log")
+      ActiveWithinDays = 0 }
+    Write-Utf8 $cfgTilde ($tildeCfg | ConvertTo-Json -Depth 4)
+    $r = Invoke-Sync -Cfg $cfgTilde
+    Check ($r.Code -eq 0 -and (Test-Path -LiteralPath (Join-Path $homeRoot "_retail_/Interface/AddOns/RetailAddon/.synced-version"))) "a ~/ root is expanded and detected"
+  } finally {
+    Remove-Item -LiteralPath $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
+  }
+
   # Activity: only SavedVariables moved recently; the top of WTF is old.
   $wowL = Join-Path $root "wowL"
   $wtf = Join-Path $wowL "_retail_/WTF"
@@ -268,6 +345,18 @@ try {
     -ManifestBase $publish -Roots "$wow,$wowB" -Yes -NoSchedule 2>&1
   $both = Get-Content -LiteralPath $setupCfg -Raw | ConvertFrom-Json
   Check (@($both.Roots).Count -eq 2) "a comma-separated -Roots is split"
+
+  # Setup exposes the direct-client flavor, and warns when a root is not a
+  # WoW install instead of leaving sync.ps1 to report "No WoW installs found".
+  $out = & $hostExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $setupCopy "Setup.ps1") `
+    -ManifestBase $publish -Roots $wow -DirectFlavor era -Yes -NoSchedule 2>&1
+  $withFlavor = Get-Content -LiteralPath $setupCfg -Raw | ConvertFrom-Json
+  Check ($LASTEXITCODE -eq 0 -and $withFlavor.DirectFlavor -eq "era") "setup writes DirectFlavor"
+  $emptyDir = Join-Path $root "not-a-wow"
+  New-Item -ItemType Directory -Force -Path $emptyDir | Out-Null
+  $out = & $hostExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $setupCopy "Setup.ps1") `
+    -ManifestBase $publish -Roots $emptyDir -Yes -NoSchedule 2>&1
+  Check (($out -join "`n") -match "not a WoW root") "setup warns on a non-WoW root"
 
   # Install-Schedule: "-Times 07:30,19:30" is one string when the script is run
   # with -File from bash or cmd, and used to become an unschedulable unit that

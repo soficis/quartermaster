@@ -230,8 +230,12 @@ python feed/worker.py check --force # exit 0, flavors populated
 .\client\Setup.ps1 -ManifestBase C:\path\to\feed\state\publish
 ```
 
-`Setup.ps1` guesses your WoW folders, writes `client/sync.config.json`, and
-offers to register the scheduler. Delete the cookies JSON when it is done.
+`Setup.ps1` detects WoW installs at the usual per-OS locations, asks which
+ones to use, warns when a folder is not a WoW layout, writes
+`client/sync.config.json`, and offers to register the scheduler. A root can
+be a parent holding `_retail_`, `_classic_`, `_classic_era_`, ... or a direct
+client (`Interface/AddOns` at its top); `~/` and `%VARS%` in a root are
+expanded. Delete the cookies JSON when it is done.
 
 Fully non-interactive, when every value is known:
 
@@ -343,9 +347,13 @@ like.
 
 A root holds flavor subfolders. That is the Battle.net layout. Or a root
 holds one direct client (`Interface/AddOns` at its top). Then `DirectFlavor`
-picks which flavor it gets. It defaults to `classic`. A root counts as
-**active** when its WTF data changed within 30 days. A past sync also marks
-it: the sync stamps every install it touches. Idle roots stay untouched.
+picks which flavor it gets (also settable with `Setup.ps1 -DirectFlavor`);
+it defaults to `classic`, except that a root folder named `_retail_`,
+`_classic_`, ... names its own flavor. Duplicate roots are collapsed, and
+roots beginning `~/` or containing `%VARS%` are expanded, on every platform.
+A root counts as **active** when its WTF data changed within 30 days. A past
+sync also marks it: the sync stamps every install it touches. Idle roots
+stay untouched.
 
 ## Verify it worked
 
@@ -427,7 +435,7 @@ A clean checkout runs green with no setup:
 
 ```powershell
 python -m unittest discover -s tests -v     # 58 tests, feed side
-.\client\tests\smoke.ps1                     # end-to-end client, 44 checks
+.\client\tests\smoke.ps1                     # end-to-end client, 55 checks
 ```
 
 The client smoke test builds a throwaway WoW root and publish folder, then
@@ -436,7 +444,10 @@ backup, a corrupted hash that must be rejected, a manifest entry with no
 checksum that must be refused, and two roots sharing one flavor that must
 get separate backups. It also dry-runs both scheduler installers, checks
 that bad `-Times`/`-At` values are refused, that `-Uninstall -WhatIf`
-removes nothing, and that a comma-separated `-Roots` becomes two roots.
+removes nothing, and that a comma-separated `-Roots` becomes two roots. It
+also checks install detection: a parent with retail/classic/era, two direct
+clients (one named for its flavor), a missing root, a duplicate root, a
+`~/` root and a `DirectFlavor` from config.
 
 The feed tests cover version ordering, release-name and URL fallbacks,
 magnet handling, opaque download names, archive extraction (including
