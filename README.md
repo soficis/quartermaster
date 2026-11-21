@@ -467,7 +467,11 @@ Linux. On macOS the feed agent ran a real check against a local page:
 headless Chrome read it, the zip downloaded and extracted, and the addon
 plus manifest landed in `publish`. The cookie exporter was also run there:
 it found Chrome in `/Applications`, used the default profile path
-containing a space, and wrote the cookie JSON.
+containing a space, and wrote the cookie JSON. Install detection was proven
+on all three with real installs into a parent holding retail/classic/era, a
+direct client, a client folder named for its flavor, and a `~/` root; on
+macOS and Linux the interactive `Setup.ps1` also detected a WoW install at
+the platform's default location and wrote it to the config after confirmation.
 
 ## Repo map
 
