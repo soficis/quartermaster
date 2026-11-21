@@ -26,7 +26,22 @@ $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script = Join-Path $here "sync.ps1"
 if (!(Test-Path -LiteralPath $script)) { throw "missing $script" }
+
+# "-Times 07:30,19:30" is one string when the script is run with -File from a
+# shell that does not split it (bash, cmd), and an array from PowerShell.
+# Accept both, then refuse anything that is not HH:mm: an unschedulable value
+# used to build a unit systemd rejects while this script reported success.
+$Times = @($Times | ForEach-Object { $_ -split '[,\s]+' } | Where-Object { $_ })
 if ($Times.Count -eq 0) { throw "no times given" }
+foreach ($t in $Times) {
+  if ($t -notmatch '^(?:[01]?\d|2[0-3]):[0-5]\d$') {
+    throw "bad -Times value '$t' (want HH:mm, like 07:30 or 07:30,19:30)"
+  }
+}
+$Times = @(foreach ($t in $Times) {
+  $h, $m = $t -split ':'
+  "{0:00}:{1:00}" -f [int]$h, [int]$m
+})
 
 $isWin = !$IsLinux -and !$IsMacOS
 $pwsh = if ($isWin) { "powershell.exe" } else {
@@ -76,6 +91,7 @@ if ($isWin) {
 }
 
 if ($IsMacOS) {
+  if (!$PSCmdlet.ShouldProcess($TaskName, "install launchd agent")) { return }
   $dir = Join-Path $HOME "Library/LaunchAgents"
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
   $entries = foreach ($t in $Times) {
@@ -107,12 +123,16 @@ $($entries -join "`n")
 "@ | Set-Content -LiteralPath $plist -Encoding UTF8
   & launchctl unload $plist 2>$null
   & launchctl load $plist
+  if ($LASTEXITCODE -ne 0) {
+    throw "launchctl could not load $plist (exit $LASTEXITCODE)"
+  }
   Write-Host "Loaded launchd agent com.addonsync at $($Times -join ', ')."
   Write-Host "Run it now:  launchctl start com.addonsync"
   return
 }
 
 # Linux: systemd user units.
+if (!$PSCmdlet.ShouldProcess($TaskName, "install systemd user timer")) { return }
 $dir = Join-Path $HOME ".config/systemd/user"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $oncals = foreach ($t in $Times) { "OnCalendar=*-*-* $t`:00" }
@@ -139,6 +159,13 @@ WantedBy=timers.target
 "@ | Set-Content -LiteralPath (Join-Path $dir "$TaskName.timer") -Encoding UTF8 -NoNewline
 & systemctl --user daemon-reload
 & systemctl --user enable --now "$TaskName.timer"
+# enable --now still exits 0 when it creates the symlink but cannot start the
+# unit, so ask systemd for the real state before reporting success.
+$state = & systemctl --user is-active "$TaskName.timer"
+if ($LASTEXITCODE -ne 0) {
+  throw "systemd did not start '$TaskName.timer' (state: $state). " +
+    "Check: systemctl --user status $TaskName.timer"
+}
 Write-Host "Enabled user timer '$TaskName' at $($Times -join ', ')."
 Write-Host "Check it:    systemctl --user list-timers $TaskName.timer"
 Write-Host "Note: user timers only fire while you are logged in, unless lingering is on (loginctl enable-linger $env:USER)."

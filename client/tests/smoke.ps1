@@ -8,7 +8,7 @@
   "up to date", upgrade with backup, corrupt sha256 leaves the old addon in
   place, and Setup.ps1 -NoSchedule stops after writing the config.
 
-  No network, no scheduler, no real game folder. Exits 1 when a check fails.
+  No network, no real scheduler, no real game folder. Exits 1 when a check fails.
 
 .EXAMPLE
   pwsh -NoProfile -File client/tests/smoke.ps1
@@ -83,6 +83,14 @@ function Invoke-Sync([string[]]$Extra = @(), [string]$Cfg = $cfgPath) {
   $ErrorActionPreference = "Continue"
   $out = & $hostExe -NoProfile -ExecutionPolicy Bypass -File $sync `
     -Config $Cfg @Extra 2>&1
+  [pscustomobject]@{ Code = $LASTEXITCODE; Output = (@($out) -join "`n") }
+}
+
+function Invoke-Sched([string[]]$Extra = @()) {
+  # Same stderr handling as Invoke-Sync; -WhatIf keeps every real scheduler
+  # (Task Scheduler, launchd, systemd) untouched.
+  $ErrorActionPreference = "Continue"
+  $out = & $hostExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $client "Install-Schedule.ps1") @Extra 2>&1
   [pscustomobject]@{ Code = $LASTEXITCODE; Output = (@($out) -join "`n") }
 }
 
@@ -245,6 +253,21 @@ try {
   $again = Get-Content -LiteralPath $setupCfg -Raw | ConvertFrom-Json
   Check ((@($again.Include) -join ",") -eq "classic" -and $again.BackupDir -eq "D:\Backups") "setup rerun keeps Include and BackupDir"
   Check ((@($again.Roots) -join ",") -eq $wowB) "setup rerun updates Roots"
+
+  # Install-Schedule: "-Times 07:30,19:30" is one string when the script is run
+  # with -File from bash or cmd, and used to become an unschedulable unit that
+  # was reported as enabled. -WhatIf keeps the real scheduler untouched.
+  $s = Invoke-Sched @("-Times", "07:30,19:30", "-TaskName", "AddonSyncSmoke", "-WhatIf")
+  Check ($s.Code -eq 0) "a comma-separated -Times is accepted"
+  Check ($s.Output -match "What if") "install-schedule honours -WhatIf"
+  $leaked = if (!$IsLinux -and !$IsMacOS) {
+    $null -ne (Get-ScheduledTask -TaskName "AddonSyncSmoke" -ErrorAction SilentlyContinue)
+  } else {
+    Test-Path -LiteralPath (Join-Path $HOME ".config/systemd/user/AddonSyncSmoke.timer")
+  }
+  Check (!$leaked) "install-schedule -WhatIf registers nothing"
+  $s = Invoke-Sched @("-Times", "nonsense", "-TaskName", "AddonSyncSmoke", "-WhatIf")
+  Check ($s.Code -ne 0 -and $s.Output -match "bad -Times") "a bad -Times value is refused"
 }
 finally {
   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
