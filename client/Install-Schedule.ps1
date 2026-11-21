@@ -75,7 +75,6 @@ if ($isWin) {
   return
 }
 
-$args = @("-NoProfile", "-File", $script)
 if ($IsMacOS) {
   $dir = Join-Path $HOME "Library/LaunchAgents"
   New-Item -ItemType Directory -Force -Path $dir | Out-Null

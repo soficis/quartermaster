@@ -28,7 +28,6 @@ param(
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $cfgPath = Join-Path $here "sync.config.json"
-$example = Join-Path $here "sync.config.example.json"
 
 function Ask([string]$Prompt, [string]$Default) {
   if ($Default) { $Prompt += " [$Default]" }
@@ -88,10 +87,20 @@ if ($Roots.Count -eq 0) {
   if ($Roots.Count -eq 0) { throw "no roots configured" }
 }
 
-@{
-  ManifestBase = $ManifestBase
-  Roots = $Roots
-} | ConvertTo-Json | Set-Content -LiteralPath $cfgPath -Encoding UTF8
+# Update only what Setup asks about; Include, Exclude, BackupDir, LogPath and
+# the rest of an existing config survive a re-run.
+$cfgData = [ordered]@{}
+if (Test-Path -LiteralPath $cfgPath) {
+  try {
+    $old = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    foreach ($p in @($old.PSObject.Properties)) { $cfgData[$p.Name] = $p.Value }
+  } catch {
+    Write-Warning "existing $cfgPath is not valid JSON; writing a fresh one"
+  }
+}
+$cfgData["ManifestBase"] = $ManifestBase
+$cfgData["Roots"] = @($Roots)
+$cfgData | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cfgPath -Encoding UTF8
 Write-Host "wrote $cfgPath"
 
 if (!$InstallSchedule -and !$NoSchedule -and !$Yes) {

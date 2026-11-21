@@ -46,6 +46,12 @@ if (!$Python) {
   $Python = $cmd.Source
 }
 if (!(Test-Path -LiteralPath $Python)) { throw "python not found: $Python" }
+# The Microsoft Store alias passes Test-Path but only opens the Store; a task
+# registered against it would fail every day with no worker log.
+& $Python -c "import sys" 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) {
+  throw "python at $Python does not run (Microsoft Store alias?); install Python or pass -Python <exe>"
+}
 $pythonw = Join-Path (Split-Path -Parent $Python) "pythonw.exe"
 if (Test-Path -LiteralPath $pythonw) { $Python = $pythonw }
 

@@ -54,8 +54,11 @@ jobs:
           }
           if ($bad.Count) { $bad | Write-Host; exit 1 }
           Write-Host "all scripts parse"
-      - name: client end-to-end
+      - name: client end-to-end (PowerShell 7)
         shell: pwsh
+        run: ./client/tests/smoke.ps1
+      - name: client end-to-end (Windows PowerShell 5.1, the client's target)
+        shell: powershell
         run: ./client/tests/smoke.ps1
       - name: scheduler installers dry-run
         shell: pwsh
