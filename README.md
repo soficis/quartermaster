@@ -82,6 +82,9 @@ them, and puts them where the game reads them.
 - **It publishes to a folder you own.** No server, no upload, no mirror.
 - **It trusts the page.** Whatever the feed says is current is what gets
   installed.
+- **It checks the bytes.** SHA-256 is verified before anything is replaced,
+  and an entry with no checksum, or with an addon or zip name that points
+  outside the target folder, is refused rather than installed.
 - **It is not affiliated** with Blizzard or with any addon author.
 
 ## Pick a shape
@@ -120,7 +123,7 @@ substituted.
 - **Where the feed runs** - same PC, home server, VPS.
 - **How archives arrive** - a watched folder, a CLI, or plain HTTP.
 - **How PCs read the feed** - local path, SMB/NFS, http(s).
-- **Which flavors** - one, or all five.
+- **Which flavors** - one, or as many as the source publishes.
 - **Which installs get touched** - activity detection, `-Include`,
   `-Exclude`, `DirectFlavor`.
 - **When it runs** - a `check_hours` gate, or your OS scheduler.
@@ -143,6 +146,10 @@ On Windows, WinRAR ships `UnRAR.exe`, not `unrar.exe`. Copy it to
 `unrar.exe` in the WinRAR folder, add that folder to `PATH`, and reopen the
 shell. Or install `unar`. `.zip` releases need nothing; other formats need
 7-Zip (`7z`).
+
+macOS has no PowerShell by default: the client and its launchd installer
+need PowerShell 7 from <https://aka.ms/ps7>. The `.tar.gz` release unpacks
+under your home folder and needs no admin rights.
 
 ## Feeds and presets
 
@@ -175,7 +182,8 @@ where to look and what to call the result:
 - `release_prefix` - the token a release filename starts with.
 - `archive_pattern` - a regex for which archives matter, or `""` for all.
 - `flavors` - addon folder name, WoW folder, display label, sort order.
-- anything else (`downloader`, `check_hours`, ...) overrides `config.json`.
+- anything else (`downloader`, `check_hours`, ...) supplies a default; a
+  non-empty value in `config.json` overrides it.
 
 Pick one with `"preset": "<name>"` in `feed/config.json`, or with the
 `ADDONSYNC_PRESET` environment variable. Addon names, site names, and
@@ -228,6 +236,13 @@ Fully non-interactive, when every value is known:
 
 `-NoSchedule` writes the config and registers nothing, for when you manage
 the scheduler yourself.
+
+The client's scheduler installer is the same on every platform: Task
+Scheduler on Windows, a launchd agent on macOS, a systemd user timer on
+Linux. `-Times` takes one or more `HH:mm` values, as an array or
+comma-separated (`-Times 06:30,18:30`); anything else is refused before
+anything is registered. `-WhatIf` shows what it would do, and `-Uninstall`
+removes it.
 
 The feed half needs a schedule too. On Windows:
 
@@ -327,12 +342,13 @@ Run these four. Each is read-only.
 python feed/worker.py status      # last_ok, last_error, needs_login, preset, flavors
 python feed/reader.py status      # browser up? page open?
 .\client\sync.ps1 -WhatIf         # what would be installed, touches nothing
-Get-ScheduledTask -TaskName AddonSync, AddonFeed
+Get-ScheduledTask -TaskName AddonSync, AddonFeed   # Windows; see below
 ```
 
 On Linux, the last line is
 `systemctl list-timers addonsync-feed.timer` for the feed and
-`systemctl --user list-timers AddonSync.timer` for the client.
+`systemctl --user list-timers AddonSync.timer` for the client. On macOS the
+client is a launchd agent: `launchctl list | Select-String com.addonsync`.
 
 Healthy looks like:
 
@@ -348,7 +364,11 @@ Healthy looks like:
 - **The same bundle downloads twice** - magnets dedupe by info hash; two
   different hashes are two different uploads.
 - **The version looks odd** - the `.toc` carries `major.minor`; the real
-  build number comes from the archive name.
+  build number comes from the archive name. When the name carries no
+  version, the `.toc` must, or the check fails instead of publishing `0`.
+- **`-Times` refused** - the scheduler installer takes `HH:mm` only and
+  stops before registering anything, rather than writing a task or timer
+  that cannot fire.
 - **Empty watch folder** - the torrent client never delivered. The check
   fails loudly after `timeout_min` rather than hanging.
 - **`no rar extractor`** - install `unrar` or `unar` on the PATH of the
@@ -384,19 +404,30 @@ or `git push`.
 A clean checkout runs green with no setup:
 
 ```powershell
-python -m unittest discover -s tests -v     # 32 tests, feed side
-.\client\tests\smoke.ps1                     # end-to-end client, 16 checks
+python -m unittest discover -s tests -v     # 55 tests, feed side
+.\client\tests\smoke.ps1                     # end-to-end client, 38 checks
 ```
 
 The client smoke test builds a throwaway WoW root and publish folder, then
 runs the real `sync.ps1`: dry run, install, up-to-date, upgrade with
-backup, and a corrupted hash that must be rejected.
+backup, a corrupted hash that must be rejected, a manifest entry with no
+checksum that must be refused, and two roots sharing one flavor that must
+get separate backups. It also dry-runs the client scheduler installer and
+checks that a bad `-Times` is refused.
 
-The feed tests cover version ordering, release-name parsing, magnet handling,
-archive extraction, publish + manifest, and every preset that ships.
+The feed tests cover version ordering, release-name and URL fallbacks,
+magnet handling, opaque download names, archive extraction, import
+failures, publish + manifest, and every preset that ships.
 
-`.github/workflows/ci.yml` runs both on Linux and Windows, parses every
-PowerShell file, and syntax-checks `install.sh`.
+`.github/workflows/ci.yml` runs the tests on Python 3.7, 3.8 and 3.12, runs
+the client smoke test under both Windows PowerShell 5.1 and PowerShell 7,
+dry-runs both scheduler installers, parses every PowerShell file, and
+syntax-checks `install.sh`.
+
+The same suite also passes on macOS 12.7 (PowerShell 7.4) and Ubuntu
+(PowerShell 7.7). A real scheduler was registered and removed on each:
+a Scheduled Task on Windows, a launchd agent on macOS, and a systemd user
+timer on Linux.
 
 ## Repo map
 
@@ -418,7 +449,7 @@ client/
   sync.ps1                  manifest -> verify -> backup -> replace
   Install-Schedule.ps1      Task Scheduler / launchd / systemd user timer
   sync.config.example.json
-  tests/smoke.ps1           end-to-end test of sync.ps1
+  tests/smoke.ps1           end-to-end test of sync.ps1 and both schedulers
 tools/
   Export-Cookies.ps1        open the page, sign in, dump cookies to JSON
 tests/                      unittest suite for worker.py, reader.py, presets
