@@ -6,7 +6,8 @@ on:
 
 jobs:
   python:
-    runs-on: ubuntu-latest
+    # 22.04 keeps prebuilt 3.7 and 3.8; ubuntu-latest no longer ships them.
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         python-version: ["3.7", "3.8", "3.12"]
@@ -67,7 +68,7 @@ jobs:
           ./client/Install-Schedule.ps1 -TaskName AddonSyncCiDryRun -WhatIf
 
   shell:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: install.sh parses
