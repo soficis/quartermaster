@@ -7,8 +7,8 @@
   "downloads_dir": "",
   "manual_feed_file": "",
   "downloader": {
-    "_comment": "method: watchdir (drop .magnet files for your torrent client), direct (http links only), or command (run this with {magnet} replaced).",
-    "method": "watchdir",
+    "_comment": "method: watchdir (drop .magnet files for your torrent client), direct (http links only), or command (run this with {magnet} replaced). Empty keeps the preset's choice, else watchdir.",
+    "method": "",
     "watch_dir": "",
     "completed_dir": "",
     "timeout_min": 120,

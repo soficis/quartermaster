@@ -19,13 +19,14 @@ Design rules:
   * one lock, one run at a time
   * every state write is atomic
   * a failed check keeps the last good state and records the error
-  * Forever is handled first
 """
 
 try:
     import fcntl
-except ImportError:  # Windows: no POSIX locks; the scheduler fires one run
-    fcntl = None  # at a time, so this is only best-effort protection
+    msvcrt = None
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
 import hashlib
 import json
 import os
@@ -35,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -121,13 +123,37 @@ if not isinstance(PRESET, dict) or not PRESET.get("flavors"):
 # flavor -> how it is labelled, which addon folder it owns, which WoW dir it
 # belongs in on Windows. The addon folder is also read from the archive; this
 # is the expected name and the tie-breaker when an archive has several.
-FLAVORS = PRESET["flavors"]
-ORDER = sorted(FLAVORS, key=lambda f: FLAVORS[f].get("rank", 99))
+
+
+def _load_flavors(raw):
+    """Lower-cased flavor keys with label/rank filled in; addon and wow required.
+
+    Release names are matched case-insensitively and looked up lower-case, and
+    wow is joined onto client paths, so both are checked here once instead of
+    failing later with a KeyError halfway through a check.
+    """
+    out = {}
+    for key, meta in raw.items():
+        name = str(key).lower()
+        if not isinstance(meta, dict) or not meta.get("addon") or not meta.get("wow"):
+            raise SystemExit('feed preset %s: flavor "%s" needs "addon" and "wow"'
+                             % (PRESET_FILE, key))
+        if not (re.match(r"^[a-z0-9_-]+$", name)
+                and re.match(r"^[A-Za-z0-9_]+$", str(meta["wow"]))):
+            raise SystemExit('feed preset %s: flavor "%s" or its wow "%s" is not '
+                             'a plain folder name' % (PRESET_FILE, key, meta["wow"]))
+        out[name] = dict(meta, label=meta.get("label") or name.title(),
+                         rank=meta.get("rank", 99))
+    return out
+
+
+FLAVORS = _load_flavors(PRESET["flavors"])
+ORDER = sorted(FLAVORS, key=lambda f: FLAVORS[f]["rank"])
 
 DEFAULTS = {
     "preset": PRESET_NAME,
     "check_hours": 24,
-    "manifest_file": None,       # manual fallback feed; default <state>/manual-feed.json
+    "manual_feed_file": None,    # manual fallback feed; default <state>/manual-feed.json
     "publish_dir": None,         # default <state>/publish
     "downloads_dir": None,       # incoming archives; default <state>/incoming
     "keep_zips": 2,
@@ -171,6 +197,7 @@ def incoming_dir(cfg):
 
 
 def manual_feed_file(cfg):
+    # manifest_file is the old name of the same setting.
     return (cfg.get("manual_feed_file") or cfg.get("manifest_file")
             or os.path.join(STATE_DIR, "manual-feed.json"))
 
@@ -246,13 +273,7 @@ def sha256_file(path):
 
 
 def version_tuple(text):
-    out = []
-    for part in re.findall(r"\d+", text or ""):
-        try:
-            out.append(int(part))
-        except ValueError:
-            out.append(0)
-    return tuple(out)
+    return tuple(int(part) for part in re.findall(r"\d+", text or ""))
 
 
 def newer(a, b):
@@ -310,17 +331,6 @@ def parse_release(text):
     return None, None
 
 
-def parse_magnet_name(url):
-    try:
-        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-        for key in ("dn", "name"):
-            if qs.get(key):
-                return qs[key][0]
-    except ValueError:
-        pass
-    return ""
-
-
 def info_hash(url):
     try:
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
@@ -337,11 +347,11 @@ def info_hash(url):
 def fetch_browser(cfg):
     """Read the thread through the local Chromium (reader); classify links."""
     import reader  # same directory; raises ImportError when missing
-    raw = reader.read_feed(cfg)
+    raw = reader.read_feed()
     items, bundles = [], []
     for m in raw.get("magnets", []):
         url = m.get("url") or ""
-        name = m.get("name") or parse_magnet_name(url)
+        name = m.get("name") or ""  # reader decodes the magnet's dn
         flavor, ver = parse_release(name)
         if flavor:
             items.append({"flavor": flavor, "version": ver, "url": url,
@@ -550,15 +560,41 @@ def _download_name(url, response):
     ext = {"application/zip": ".zip",
            "application/x-rar-compressed": ".rar",
            "application/vnd.rar": ".rar",
-           "application/x-7z-compressed": ".7z"}.get(ctype, ".rar")
+           "application/x-7z-compressed": ".7z"}.get(ctype, "")
+    raw = next((c for c in cands if c), "") or "download"
     base = re.sub(r"[^A-Za-z0-9._ -]+", "_",
-                  urllib.parse.unquote(cands[-1] or "download")) or "download"
+                  urllib.parse.unquote(raw)) or "download"
     return base + ext
 
 
+_ARCHIVE_MAGIC = ((b"PK\x03\x04", ".zip"), (b"Rar!\x1a\x07", ".rar"),
+                  (b"7z\xbc\xaf\x27\x1c", ".7z"))
+
+
+def _sniff_archive(path):
+    """The archive extension that matches a file's first bytes, or ""."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8)
+    except OSError:
+        return ""
+    return next((ext for magic, ext in _ARCHIVE_MAGIC
+                 if head.startswith(magic)), "")
+
+
 def http_download(url, cfg, dest_dir):
-    """Direct download; uses the browser session when the host needs it."""
-    host = page_host(cfg)
+    """Direct download; returns the archive path, or None for a non-archive.
+
+    Forum attachment links include images and other files. One saved under an
+    archive name would fail extraction on every later check, so a download
+    that neither names nor looks like an archive is discarded.
+    """
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+    except ValueError:
+        host = ""
+    # Only cookies the browser itself would send to this host: a link to
+    # another site must not carry the page session along.
     cookies = [c for c in browser_cookies()
                if cookie_matches(c.get("domain"), host)]
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -568,17 +604,29 @@ def http_download(url, cfg, dest_dir):
         headers["Cookie"] = "; ".join(
             "%s=%s" % (c["name"], c["value"]) for c in cookies)
     req = urllib.request.Request(url, headers=headers)
+    tmp = None
     try:
         with urllib.request.urlopen(req,
                                     timeout=cfg.get("request_timeout", 40)) as r:
-            dest = os.path.join(dest_dir, _download_name(url, r))
-            tmp = dest + ".part"
+            name = _download_name(url, r)
+            tmp = os.path.join(dest_dir, name + ".part")
             with open(tmp, "wb") as fh:
                 shutil.copyfileobj(r, fh)
+        if not ARCHIVE_RE.search(name):
+            ext = _sniff_archive(tmp)
+            if not ext:
+                os.remove(tmp)
+                log("not an archive, ignored: %s" % url[:90])
+                return None
+            name += ext
+        dest = os.path.join(dest_dir, name)
+        os.replace(tmp, dest)
+        return dest
     except urllib.error.HTTPError as exc:
-        raise RuntimeError("HTTP %d for %s" % (exc.code, url))
-    os.replace(tmp, dest)
-    return dest
+        raise RuntimeError("HTTP %d for %s" % (exc.code, url)) from exc
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.remove(tmp)
 
 
 # ---------------------------------------------------------------- extract/publish
@@ -692,13 +740,33 @@ def toc_version(folder):
 def make_zip(folder, zip_path):
     tmp = zip_path + ".tmp"
     parent = os.path.dirname(folder)
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for root, _dirs, files in os.walk(folder):
-            for f in files:
-                full = os.path.join(root, f)
-                rel = os.path.relpath(full, parent)
-                zf.write(full, rel)
-    os.replace(tmp, zip_path)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED,
+                             compresslevel=6) as zf:
+            for root, _dirs, files in os.walk(folder):
+                for f in files:
+                    full = os.path.join(root, f)
+                    rel = os.path.relpath(full, parent)
+                    zf.write(full, rel)
+        os.replace(tmp, zip_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _reject_links(folder):
+    """Refuse a tree holding symlinks or junctions.
+
+    rar and 7z archives can carry links; copying and zipping follow them, so a
+    link to ~/.ssh or the cookie file would ship its target to every client.
+    """
+    isjunction = getattr(os.path, "isjunction", lambda _p: False)
+    for root, dirs, files in os.walk(folder):
+        for name in dirs + files:
+            path = os.path.join(root, name)
+            if os.path.islink(path) or isjunction(path):
+                raise RuntimeError("archive contains a link, not publishing: %s"
+                                   % os.path.relpath(path, folder))
 
 
 def prune(directory, pattern, keep):
@@ -717,8 +785,8 @@ def prune(directory, pattern, keep):
 
 def _sweep_stale_stages(dest, older_than=3600):
     # A crash between staging and cleanup leaves .new-*/.old-* in the served
-    # folder. Only old ones go: on Windows there is no lock, and a young one
-    # may belong to a run still in progress.
+    # folder. Only old ones go, in case a young one belongs to a run that
+    # still holds the lock from another state directory.
     now = time.time()
     try:
         names = os.listdir(dest)
@@ -744,31 +812,36 @@ def publish(flavor, addon_dir, version, archive, source, cfg,
     _sweep_stale_stages(dest)
     addon_name = addon_name or os.path.basename(addon_dir)
 
+    _reject_links(addon_dir)
     stage = os.path.join(dest, ".new-%s" % uuid.uuid4().hex[:8])
     os.makedirs(stage, exist_ok=True)
-    target = os.path.join(stage, addon_name)
-    shutil.copytree(addon_dir, target, symlinks=True)
-    with open(os.path.join(target, ".synced-version"), "w",
-              encoding="utf-8") as fh:
-        fh.write(version + "\n")
+    try:
+        target = os.path.join(stage, addon_name)
+        shutil.copytree(addon_dir, target)
+        with open(os.path.join(target, ".synced-version"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(version + "\n")
 
-    final = os.path.join(dest, addon_name)
-    old = os.path.join(dest, ".old-%s" % uuid.uuid4().hex[:8])
-    if os.path.exists(final):
-        os.replace(final, old)
-    os.replace(target, final)
-    shutil.rmtree(stage, ignore_errors=True)
-    shutil.rmtree(old, ignore_errors=True)
+        # Zip and hash the staged copy; the live folder is swapped only once
+        # the zip the manifest will point at exists.
+        zip_name = "%s-%s.zip" % (addon_name, version)
+        zip_path = os.path.join(dest, zip_name)
+        make_zip(target, zip_path)
+        digest = sha256_file(zip_path)
+        size = os.path.getsize(zip_path)
 
-    zip_name = "%s-%s.zip" % (addon_name, version)
-    zip_path = os.path.join(dest, zip_name)
-    make_zip(final, zip_path)
-    digest = sha256_file(zip_path)
-    size = os.path.getsize(zip_path)
+        final = os.path.join(dest, addon_name)
+        old = os.path.join(dest, ".old-%s" % uuid.uuid4().hex[:8])
+        if os.path.exists(final):
+            os.replace(final, old)
+        os.replace(target, final)
+        shutil.rmtree(old, ignore_errors=True)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
-    # keep the last N zips per flavor
+    # Keep the newest N zips per flavor; never fewer than the one just made.
     prune(dest, r"^%s-\d.*\.zip$" % re.escape(addon_name),
-          int(cfg.get("keep_zips", 2)))
+          max(1, int(cfg.get("keep_zips", 2))))
 
     return {
         "flavor": flavor,
@@ -785,21 +858,32 @@ def publish(flavor, addon_dir, version, archive, source, cfg,
     }
 
 
+def _already_current(flavor, ver, st, force):
+    current = st["flavors"].get(flavor, {}).get("version")
+    if force or newer(ver, current):
+        return False
+    log("%s %s already current (%s)" % (flavor, ver, current))
+    return True
+
+
 def import_archive(path, cfg, st, force=False):
     flavor, ver = parse_release(os.path.basename(path))
-    if not flavor:
-        # generic bundle member: extract and identify from the folder/toc
-        tmp = tempfile.mkdtemp(prefix="addon-sync-id-", dir=STAGE)
-        try:
-            extract_archive(path, tmp)
+    # A named archive is skipped before extraction: the incoming folder is
+    # re-scanned on every check that downloads nothing.
+    if flavor and _already_current(flavor, ver, st, force):
+        return []
+    tmp = tempfile.mkdtemp(prefix="addon-sync-%s-" % (flavor or "id"),
+                           dir=STAGE)
+    try:
+        extract_archive(path, tmp)
+        if not flavor:
+            # generic bundle member: identify it from the folder/toc
             root = find_addon_root(tmp)
             if not root:
                 return []
             addon = addon_name_for(root, tmp).lower()
-            for f, meta in FLAVORS.items():
-                if addon == meta["addon"].lower():
-                    flavor = f
-                    break
+            flavor = next((f for f, meta in FLAVORS.items()
+                           if addon == meta["addon"].lower()), None)
             if not flavor:
                 return []
             # The name carries no version, so the toc must. A made-up "0"
@@ -809,16 +893,8 @@ def import_archive(path, cfg, st, force=False):
                 raise RuntimeError(
                     "cannot tell the version of %s: the file name has none "
                     "and the .toc has no ## Version" % os.path.basename(path))
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-    if not force and not newer(ver, st["flavors"].get(flavor, {}).get("version")):
-        log("%s %s already current (%s)" % (flavor, ver,
-                                            st["flavors"][flavor]["version"]))
-        return []
-
-    tmp = tempfile.mkdtemp(prefix="addon-sync-%s-" % flavor, dir=STAGE)
-    try:
-        extract_archive(path, tmp)
+            if _already_current(flavor, ver, st, force):
+                return []
         expected = FLAVORS[flavor]["addon"]
         root = find_addon_root(tmp, expected)
         if not root:
@@ -882,20 +958,82 @@ def build_manifest(cfg, st):
 # ---------------------------------------------------------------- run
 
 def _try_lock():
-    """Take the cross-process check lock. Returns (locked, fh).
+    """Take the cross-process check lock: the open file, or None when busy.
 
-    (False, fh) when another check or import holds it. Where fcntl is
-    missing (Windows) there is no lock to take; the caller proceeds, and
-    the README says so. Callers close fh exactly once.
+    flock on POSIX, a one-byte msvcrt lock on Windows; either is released by
+    the OS if the process dies. Pass the result to _unlock exactly once.
     """
     fh = open(LOCK, "w")
-    if fcntl is None:
-        return False, fh
     try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return False, fh
-    return True, fh
+        if fcntl is not None:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+def _unlock(fh):
+    try:
+        if fcntl is not None:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        else:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    fh.close()
+
+
+def _looks_logged_out(text):
+    low = (text or "").lower()
+    return "logged out" in low or "login" in low or "no release links" in low
+
+
+# A page can carry many attachments (screenshots too); remember enough of them
+# that none is fetched again on every check.
+SEEN_LIMIT = 500
+
+
+def _fetch_all(feed, cfg, st, force, incoming):
+    """Download what the feed lists and is new. Returns local archive paths."""
+    archives = []
+    for item in sorted(feed["items"], key=lambda i: ORDER.index(i["flavor"])):
+        flavor, ver = item["flavor"], item["version"]
+        current = st["flavors"].get(flavor, {}).get("version")
+        if not force and ver and not newer(ver, current):
+            continue
+        try:
+            if item["kind"] == "magnet":
+                archives += enqueue_magnet(item["url"], cfg)
+            else:
+                archives.append(http_download(item["url"], cfg, incoming))
+        except Exception as exc:
+            _record_import_error(st, "%s %s" % (flavor, ver), exc,
+                                 verb="download")
+
+    # bundles: download only when the link is new
+    for bundle in feed["bundles"]:
+        h = info_hash(bundle["url"])
+        if not force and h in st["seen_magnets"]:
+            continue
+        try:
+            if bundle["kind"] == "magnet":
+                got = enqueue_magnet(bundle["url"], cfg)
+                if not got:
+                    continue  # downloader=direct skipped it; not seen yet
+                archives += got
+            else:
+                archives.append(http_download(bundle["url"], cfg, incoming))
+        except Exception as exc:
+            _record_import_error(st, bundle.get("name") or h, exc,
+                                 verb="download")
+            continue
+        st["seen_magnets"] = (st["seen_magnets"] + [h])[-SEEN_LIMIT:]
+        save_state(st)
+    return [p for p in archives if p and os.path.exists(p)]
 
 
 def run_check(force=False, triggered=False):
@@ -903,31 +1041,33 @@ def run_check(force=False, triggered=False):
     incoming = incoming_dir(cfg)
     for d in (STATE_DIR, STAGE, incoming, publish_dir(cfg)):
         os.makedirs(d, exist_ok=True)
-    locked, lock_fh = _try_lock()
-    if fcntl is not None and not locked:
+    lock_fh = _try_lock()
+    if lock_fh is None:
         log("another check is running; skipping")
-        lock_fh.close()
         return {"ok": False, "error": "busy"}
+    try:
+        st = state()
+        now = int(time.time())
+        due = force or triggered or not st["last_check"] or (
+            now - int(st["last_check"]) >= int(cfg["check_hours"]) * 3600 - 120)
+        if not due:
+            return {"ok": True, "skipped": "not due", "state": st}
+        return _check(cfg, st, now, force, incoming)
+    finally:
+        _unlock(lock_fh)
 
-    st = state()
-    now = int(time.time())
-    due = force or triggered or not st["last_check"] or (
-        now - int(st["last_check"]) >= int(cfg["check_hours"]) * 3600 - 120)
-    if not due:
-        return {"ok": True, "skipped": "not due", "state": st}
 
+def _check(cfg, st, now, force, incoming):
     st["last_check"] = now
+    # This run's errors only: a fixed failure must not keep reporting.
+    st["last_error"] = ""
     save_state(st)
     log("check start (reader=browser)")
     try:
         feed = fetch_feed(cfg)
-        # A thread page with release links but zero per-flavor items and no
-        # attachment links means the browser is logged out (guests see
-        # magnets only).
-        st["needs_login"] = (feed["source"] == "browser"
-                             and not feed["items"]
-                             and not feed.get("bundles")
-                             and not feed.get("attachments"))
+        # fetch_feed returns a browser feed only when it found links, so a
+        # logged-out page shows up as a manifest fallback with a browser error.
+        st["needs_login"] = _looks_logged_out(feed.get("browser_error"))
         st["last_feed"] = {"source": feed["source"],
                            "fingerprint": feed["fingerprint"],
                            "items": len(feed["items"]),
@@ -938,55 +1078,14 @@ def run_check(force=False, triggered=False):
                 % feed["browser_error"])
         save_state(st)
 
-        archives = []
-        # explicit per-flavor entries
-        for item in sorted(feed["items"], key=lambda i: FLAVORS[i["flavor"]]["rank"]):
-            flavor, ver = item["flavor"], item["version"]
-            current = st["flavors"].get(flavor, {}).get("version")
-            if not force and ver and not newer(ver, current):
-                continue
-            try:
-                if item["kind"] == "magnet":
-                    archives += enqueue_magnet(item["url"], cfg)
-                elif item["kind"] == "http":
-                    archives.append(http_download(item["url"], cfg, incoming))
-                elif item["kind"] == "missing":
-                    log("no link for %s %s" % (flavor, ver))
-            except Exception as exc:
-                _record_import_error(st, "%s %s" % (flavor, ver), exc,
-                                     verb="download")
-
-        # bundle magnets: download only when the info hash is new
-        for bundle in feed["bundles"]:
-            h = info_hash(bundle["url"])
-            if not force and h in st["seen_magnets"]:
-                continue
-            try:
-                if bundle["kind"] == "magnet":
-                    archives += enqueue_magnet(bundle["url"], cfg)
-                else:
-                    archives.append(http_download(bundle["url"], cfg, incoming))
-            except Exception as exc:
-                _record_import_error(st, bundle.get("name") or h, exc,
-                                     verb="download")
-                continue
-            st["seen_magnets"] = (st["seen_magnets"] + [h])[-20:]
-            save_state(st)
-
-        # archives already in the incoming folder, in case a fetch returned
-        # only a summary
+        archives = _fetch_all(feed, cfg, st, force, incoming)
+        # Nothing new downloaded: retry what already sits in incoming (a
+        # torrent that finished after the last check stopped waiting).
         if not archives:
             archives = [os.path.join(incoming, n)
                         for n in os.listdir(incoming)
                         if archive_matches(n)]
-
-        archives = [p for p in archives if os.path.exists(p)]
-        fetch_errors = st.get("last_error") or ""
-        st["last_error"] = ""
         done = import_archives(archives, cfg, st, force=force)
-        if fetch_errors:
-            st["last_error"] = (fetch_errors + "; " + st["last_error"]
-                                if st["last_error"] else fetch_errors)
         build_manifest(cfg, st)
         failed = st["last_error"]
         if not failed:
@@ -1001,36 +1100,27 @@ def run_check(force=False, triggered=False):
         log("check done: %d updated" % len(done))
         return {"ok": True, "updated": done, "state": st}
     except Exception as exc:
-        low = str(exc).lower()
-        st["needs_login"] = ("logged out" in low or "login" in low
-                             or "no release links" in low)
+        st["needs_login"] = _looks_logged_out(str(exc))
         st["last_error"] = str(exc)
         save_state(st)
         log("check failed: %s" % exc)
         return {"ok": False, "error": str(exc),
                 "needs_login": st["needs_login"]}
-    finally:
-        if locked:
-            fcntl.flock(lock_fh, fcntl.LOCK_UN)
-        lock_fh.close()
 
 
 def import_from_downloads(force=False):
     cfg = config()
     incoming = incoming_dir(cfg)
-    for d in (STATE_DIR, STAGE, publish_dir(cfg)):
+    for d in (STATE_DIR, STAGE, incoming, publish_dir(cfg)):
         os.makedirs(d, exist_ok=True)
-    locked, lock_fh = _try_lock()
-    if fcntl is not None and not locked:
+    lock_fh = _try_lock()
+    if lock_fh is None:
         log("another check is running; skipping import")
-        lock_fh.close()
         return {"ok": False, "error": "busy"}
     try:
         st = state()
-        paths = []
-        for name in os.listdir(incoming):
-            if archive_matches(name):
-                paths.append(os.path.join(incoming, name))
+        paths = [os.path.join(incoming, name)
+                 for name in os.listdir(incoming) if archive_matches(name)]
         st["last_error"] = ""
         done = import_archives(paths, cfg, st, force=force)
         build_manifest(cfg, st)
@@ -1042,9 +1132,7 @@ def import_from_downloads(force=False):
             out["error"] = st["last_error"]
         return out
     finally:
-        if locked:
-            fcntl.flock(lock_fh, fcntl.LOCK_UN)
-        lock_fh.close()
+        _unlock(lock_fh)
 
 
 # ---------------------------------------------------------------- status
@@ -1075,12 +1163,13 @@ def status_data():
 def request_check():
     """Start a check now: via the service, else a detached worker process."""
     try:
-        subprocess.run(["/usr/bin/systemctl", "start",
-                        "addonsync-feed.service"],
-                       timeout=15, capture_output=True)
-        return True
-    except Exception:
-        pass
+        done = subprocess.run(["/usr/bin/systemctl", "start",
+                               "addonsync-feed.service"],
+                              timeout=15, capture_output=True)
+        if done.returncode == 0:
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass  # no systemd here: run the check ourselves
     try:
         subprocess.Popen(
             [sys.executable, os.path.join(BASE_DIR, "worker.py"), "check",

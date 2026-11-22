@@ -171,8 +171,10 @@ writes `/etc/addon-sync.json` when missing, and enables `addonsync-feed.timer`
    `local-` preset has to exist before you run it, or copy it into
    `/opt/addon-sync/feeds/` afterwards.
 2. Cookies: copy the exported JSON to the host and run
-   `/usr/bin/python3 /opt/addon-sync/reader.py import-cookies`, then delete it.
-3. `sudo /usr/bin/python3 /opt/addon-sync/worker.py check --force`
+   `sudo ADDONSYNC_STATE_DIR=/var/lib/addon-sync ADDONSYNC_CONFIG=/etc/addon-sync.json /usr/bin/python3 /opt/addon-sync/reader.py import-cookies`,
+   then delete it. Without those two variables the scripts read the config
+   and state next to themselves, not the service's.
+3. `sudo ADDONSYNC_STATE_DIR=/var/lib/addon-sync ADDONSYNC_CONFIG=/etc/addon-sync.json /usr/bin/python3 /opt/addon-sync/worker.py check --force`
 4. Share `/var/lib/addon-sync/publish` over SMB, or serve it:
 
 ```sh

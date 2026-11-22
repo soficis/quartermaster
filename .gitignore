@@ -2,6 +2,7 @@
 client/sync.config.json
 feed/config.json
 examples/homelab/deploy.config.json
+*.config.json
 
 # ---- secrets that must never be committed ----
 *.pw

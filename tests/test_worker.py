@@ -87,12 +87,6 @@ class MagnetTests(unittest.TestCase):
         self.assertEqual(len(digest), 40)
         self.assertEqual(digest, hashlib.sha1(b"magnet:?dn=nohash").hexdigest())
 
-    def test_display_name(self):
-        url = "magnet:?xt=urn:btih:1&dn=Demo%20Release%20Retail%2011.2.0"
-        self.assertEqual(worker.parse_magnet_name(url),
-                         "Demo Release Retail 11.2.0")
-        self.assertEqual(worker.parse_magnet_name("magnet:?xt=urn:btih:1"), "")
-
 
 class ArchiveTests(unittest.TestCase):
     def setUp(self):
@@ -198,6 +192,28 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(entry["size"], os.path.getsize(zip_path))
         self.assertEqual(entry["addon"], "DemoAddon")
         self.assertEqual(entry["flavor"], "retail")
+
+    def test_keep_zips_zero_still_keeps_the_new_zip(self):
+        addon = make_addon(os.path.join(self.tmp, "src"))
+        cfg = dict(self.cfg, keep_zips=0)
+        entry = worker.publish("retail", addon, "11.2.0", None, "archive", cfg)
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.publish, "retail", entry["zip"])))
+
+    def test_publish_refuses_symlinks(self):
+        addon = make_addon(os.path.join(self.tmp, "src"))
+        secret = os.path.join(self.tmp, "secret.txt")
+        with open(secret, "w") as fh:
+            fh.write("cookie")
+        try:
+            os.symlink(secret, os.path.join(addon, "leak.lua"))
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot create symlinks here")
+        with self.assertRaises(RuntimeError):
+            worker.publish("retail", addon, "11.2.0", None, "archive",
+                           self.cfg)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.publish, "retail", "DemoAddon-11.2.0.zip")))
 
     def test_manifest_is_the_contract_the_client_reads(self):
         addon = make_addon(os.path.join(self.tmp, "src"))
@@ -431,17 +447,63 @@ class RunCheckTests(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertIn("retail 11.2.0", worker.state()["last_error"])
 
-    @unittest.skipIf(worker.fcntl is None, "no fcntl on Windows")
     def test_import_refuses_while_a_check_holds_the_lock(self):
-        locked, fh = worker._try_lock()
-        self.assertTrue(locked)
+        fh = worker._try_lock()
+        self.assertIsNotNone(fh)
         try:
             out = worker.import_from_downloads()
         finally:
-            worker.fcntl.flock(fh, worker.fcntl.LOCK_UN)
-            fh.close()
+            worker._unlock(fh)
         self.assertFalse(out["ok"])
         self.assertEqual(out["error"], "busy")
+        # released: the next run gets it
+        fh = worker._try_lock()
+        self.assertIsNotNone(fh)
+        worker._unlock(fh)
+
+    def test_a_fixed_failure_stops_being_reported(self):
+        bad = os.path.join(self.incoming, "Demo Release Retail 11.2.0.zip")
+        with open(bad, "wb") as fh:
+            fh.write(b"not a zip")
+        with mock.patch.object(worker, "fetch_feed",
+                               return_value=self._feed(attachments=1)):
+            self.assertFalse(worker.run_check(force=True)["ok"])
+            os.remove(bad)
+            out = worker.run_check(force=True)
+        self.assertTrue(out["ok"], out)
+        st = worker.state()
+        self.assertEqual(st["last_error"], "")
+        self.assertGreater(st["last_ok"], 0)
+
+    def test_not_due_releases_the_lock(self):
+        with mock.patch.object(worker, "fetch_feed",
+                               return_value=self._feed(attachments=1)):
+            worker.run_check(force=True)
+            out = worker.run_check()
+        self.assertEqual(out.get("skipped"), "not due")
+        fh = worker._try_lock()
+        self.assertIsNotNone(fh)
+        worker._unlock(fh)
+
+    def test_logged_out_browser_with_manifest_fallback_needs_login(self):
+        feed = self._feed(source="manifest", browser_error=(
+            "browser: no magnet or attachment links found (logged out?)"))
+        with mock.patch.object(worker, "fetch_feed", return_value=feed):
+            worker.run_check(force=True)
+        self.assertTrue(worker.state()["needs_login"])
+
+    def test_direct_skipped_magnet_is_not_marked_seen(self):
+        bundle = {"kind": "magnet", "url": "magnet:?xt=urn:btih:ABC",
+                  "name": "b"}
+        with mock.patch.object(worker, "fetch_feed",
+                               return_value=self._feed(bundles=[bundle])),                 mock.patch.object(worker, "enqueue_magnet", return_value=[]):
+            worker.run_check(force=True)
+        self.assertNotIn("abc", worker.state()["seen_magnets"])
+
+    def test_import_creates_a_missing_incoming_folder(self):
+        shutil.rmtree(self.incoming)
+        out = worker.import_from_downloads()
+        self.assertTrue(out["ok"], out)
 
 
 class FetchBrowserTests(unittest.TestCase):
@@ -475,12 +537,26 @@ class FetchBrowserTests(unittest.TestCase):
         self.assertEqual(feed["bundles"][0]["kind"], "http")
 
 
+class PresetFlavorTests(unittest.TestCase):
+    def test_missing_rank_and_label_get_defaults(self):
+        flavors = worker._load_flavors(
+            {"Retail": {"addon": "DemoAddon", "wow": "_retail_"}})
+        self.assertEqual(flavors["retail"]["rank"], 99)
+        self.assertEqual(flavors["retail"]["label"], "Retail")
+
+    def test_missing_wow_or_a_path_is_refused(self):
+        for meta in ({"addon": "DemoAddon"},
+                     {"addon": "DemoAddon", "wow": "../_retail_"}):
+            with self.assertRaises(SystemExit):
+                worker._load_flavors({"retail": meta})
+
+
 class HttpDownloadNamingTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="addonsync-dl-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
-    def _dl(self, url, headers):
+    def _dl(self, url, headers, body=b"fake-archive-bytes", cookies=()):
         from email.message import Message
         msg = Message()
         for key, value in headers.items():
@@ -493,12 +569,20 @@ class HttpDownloadNamingTests(unittest.TestCase):
             def __exit__(self, *args):
                 self.close()
 
-        resp = Resp(b"fake-archive-bytes")
+        resp = Resp(body)
         resp.headers = msg
-        with mock.patch.object(worker, "browser_cookies", return_value=[]), \
+        self.sent = None
+
+        def urlopen(req, timeout=None):
+            self.sent = req
+            return resp
+
+        with mock.patch.object(worker, "browser_cookies",
+                               return_value=list(cookies)), \
                 mock.patch.object(worker.urllib.request, "urlopen",
-                                  return_value=resp):
-            return worker.http_download(url, {}, self.tmp)
+                                  side_effect=urlopen):
+            return worker.http_download(
+                url, {"thread_url": "https://forum.example.com/t/1"}, self.tmp)
 
     def test_content_disposition_names_opaque_urls(self):
         dest = self._dl("https://forum.example.com/forum/attachments/12345/",
@@ -518,6 +602,28 @@ class HttpDownloadNamingTests(unittest.TestCase):
         dest = self._dl("https://cdn.example.com/Demo.Release.Retail.11.2.0.zip",
                         {"Content-Type": "application/octet-stream"})
         self.assertTrue(dest.endswith("Demo.Release.Retail.11.2.0.zip"))
+
+    def test_a_non_archive_attachment_is_discarded(self):
+        dest = self._dl("https://forum.example.com/forum/attachments/shot-png.9/",
+                        {"Content-Type": "image/png"}, body=b"\x89PNG....")
+        self.assertIsNone(dest)
+        self.assertEqual(os.listdir(self.tmp), [])
+
+    def test_an_unnamed_archive_is_recognised_by_its_bytes(self):
+        dest = self._dl("https://forum.example.com/forum/attachments/77/",
+                        {"Content-Type": "application/octet-stream"},
+                        body=b"Rar!\x1a\x07\x00rest")
+        self.assertTrue(dest.endswith(".rar"), dest)
+
+    def test_session_cookies_stay_on_their_own_host(self):
+        jar = [{"name": "xf_session", "value": "s",
+                "domain": ".forum.example.com"}]
+        self._dl("https://cdn.other.example/Demo.Release.Retail.11.2.0.zip",
+                 {}, cookies=jar)
+        self.assertIsNone(self.sent.get_header("Cookie"))
+        self._dl("https://forum.example.com/attachments/1/",
+                 {"Content-Type": "application/zip"}, cookies=jar)
+        self.assertEqual(self.sent.get_header("Cookie"), "xf_session=s")
 
 
 if __name__ == "__main__":

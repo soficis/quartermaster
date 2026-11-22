@@ -20,7 +20,6 @@ CLI:
   reader.py read     ensure the browser, print the feed links as JSON
   reader.py browser  ensure the browser is running
   reader.py login    ensure running, start x11vnc, print sign-in instructions
-  reader.py cookies  print the browser's cookies as JSON (for http fetches)
   reader.py status   JSON: display/browser/page state
   reader.py stop     close Chromium (and x11vnc), keep Xvfb
 """
@@ -69,17 +68,31 @@ def log(msg):
     print(line, flush=True)
 
 
-def cfg(key, default):
+def _config():
     try:
         with open(CONF, encoding="utf-8-sig") as fh:
-            return json.load(fh).get(key, default)
+            data = json.load(fh)
     except (OSError, ValueError):
-        return default
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def cfg(key, default):
+    """config.json, else the preset, else `default`, like worker.py's merge.
+
+    Empty values ("", null, []) count as unset, so a verbatim copy of
+    config.example.json ("browser_profile": "") keeps the default.
+    """
+    for source in (_config(), preset()):
+        value = source.get(key)
+        if value not in (None, "", []):
+            return value
+    return default
 
 
 def preset_name():
     return (os.environ.get("ADDONSYNC_PRESET")
-            or cfg("preset", DEF_PRESET) or DEF_PRESET)
+            or _config().get("preset") or DEF_PRESET)
 
 
 def preset():
@@ -102,19 +115,29 @@ def preset():
 
 def thread_url():
     """The config wins; otherwise the preset supplies the page to read."""
-    return cfg("thread_url", "") or preset().get("thread_url", "") or ""
+    return cfg("thread_url", "")
 
 
-def page_host():
-    """Host of the feed page: matches tabs, cookies and status."""
+def _host(url):
     try:
-        return urllib.parse.urlparse(thread_url()).netloc
+        return (urllib.parse.urlparse(url or "").hostname or "").lower()
     except ValueError:
         return ""
 
 
+def page_host():
+    """Host of the feed page (no port): matches tabs, cookies and status."""
+    return _host(thread_url())
+
+
+def on_page_host(url):
+    """True when a tab URL is on the feed page's host, not merely mentions it."""
+    host = page_host()
+    return bool(host) and _host(url) == host
+
+
 def cookie_domain():
-    host = page_host().split(":")[0]
+    host = page_host()
     return "." + host if host else ""
 
 
@@ -213,7 +236,7 @@ def debugger_url(port, want_thread=True):
              if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
     if want_thread:
         for t in pages:
-            if page_host() and page_host() in (t.get("url") or ""):
+            if on_page_host(t.get("url")):
                 return t["webSocketDebuggerUrl"]
         return None
     return pages[0]["webSocketDebuggerUrl"] if pages else None
@@ -305,9 +328,17 @@ def _listener_pid(port):
 
 
 def _is_browser_pid(pid):
-    """Never kill a stranger that happens to hold the debug port."""
+    """Never kill a stranger that holds the debug port or reused a stale pid."""
     if os.name != "nt":
-        return True
+        # Our browser is the one started with this debug port; ps works on
+        # Linux and macOS alike.
+        try:
+            out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                 capture_output=True, text=True,
+                                 timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return "remote-debugging-port=%d" % debug_port() in out
     try:
         out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid,
                               "/FO", "CSV", "/NH"],
@@ -635,6 +666,9 @@ def _dn(url):
     return ""
 
 
+_ARCHIVE_HREF = re.compile(r"\.(?:zip|rar|7z)(?=$|[?#])", re.I)
+
+
 def extract_links(html, base=None):
     """Raw links: magnets (+display names) and attachment hrefs."""
     base = base or thread_url()
@@ -645,12 +679,16 @@ def extract_links(html, base=None):
         if m in seen:
             continue
         seen.add(m)
-        magnets.append({"url": m, "name": _dn(m) or "feed bundle"})
+        magnets.append({"url": m, "name": _dn(m)})
     attachments, seen_href = [], set()
     for href, href_sq, label in re.findall(
-            r'''href=(?:"([^"]*(?:/attachments/)[^"]*)"|'([^']*(?:/attachments/)[^']*)')[^>]*>(.*?)</a>''',
+            r'''<a\b[^>]*?href=(?:"([^"]*)"|'([^']*)')[^>]*>(.*?)</a>''',
             text, re.I | re.S):
         href = href or href_sq
+        # Forum attachments (opaque /attachments/ URLs) and plain links to
+        # an archive file; anything else on the page is navigation.
+        if "/attachments/" not in href and not _ARCHIVE_HREF.search(href):
+            continue
         href = urllib.parse.urljoin(base, href.replace("&amp;", "&"))
         if href in seen_href:
             continue
@@ -661,7 +699,7 @@ def extract_links(html, base=None):
     return magnets, attachments
 
 
-def read_feed(cfg=None):
+def read_feed():
     """Ensure the browser, read the thread, return raw links.
 
     Returns {"source": "browser", "magnets": [...], "attachments": [...],
@@ -697,10 +735,9 @@ def status():
     except (OSError, ValueError):
         targets, up = [], False
     pages = [t.get("url") for t in targets if t.get("type") == "page"]
-    host = page_host()
     return {"ok": True, "display": display(), "port": port,
             "browser": up, "profile": profile_dir(),
-            "thread_open": any(host and host in (u or "") for u in pages),
+            "thread_open": any(on_page_host(u) for u in pages),
             "pages": pages}
 
 
@@ -749,17 +786,13 @@ def main(argv):
         except (OSError, RuntimeError, ValueError) as exc:
             print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
             return 1
-    if cmd == "cookies":
-        ensure_browser()
-        print(json.dumps(browser_cookies(), indent=2))
-        return 0
     if cmd == "status":
         print(json.dumps(status(), indent=2, sort_keys=True))
         return 0
     if cmd == "stop":
         print(json.dumps(stop_browser()))
         return 0
-    print("usage: reader.py [read|browser|login|cookies|import-cookies [file]|status|stop]")
+    print("usage: reader.py [read|browser|login|import-cookies [file]|status|stop]")
     return 2
 
 

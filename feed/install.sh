@@ -68,16 +68,23 @@ systemctl enable --now addonsync-feed.timer
 systemctl is-active addonsync-feed.timer
 systemctl list-timers addonsync-feed.timer --no-pager
 
+# Every command below, and every one printed for the user, must read the same
+# config and state as the service unit does.
+export ADDONSYNC_STATE_DIR="$STATE_DIR" ADDONSYNC_CONFIG="$CONFIG_FILE"
+ENV="ADDONSYNC_STATE_DIR=$STATE_DIR ADDONSYNC_CONFIG=$CONFIG_FILE"
+
 echo "== browser warm-up (first launch downloads nothing, just starts Chromium)"
-python3 "$INSTALL_DIR/reader.py" browser | tail -5
-python3 "$INSTALL_DIR/reader.py" status | tail -12
+# A fresh config has no page to open yet; that is a next step, not a failure.
+python3 "$INSTALL_DIR/reader.py" browser | tail -5 ||
+  echo "browser not started yet: set preset/thread_url in $CONFIG_FILE first"
+python3 "$INSTALL_DIR/reader.py" status | tail -12 || true
 
 echo
 echo "== next steps"
 echo "1. Give the feed browser your page session (see README 'Signing in to the page'):"
 echo "     scp cookies.json root@this-host:$STATE_DIR/cookies.json"
-echo "     python3 $INSTALL_DIR/reader.py import-cookies"
+echo "     $ENV python3 $INSTALL_DIR/reader.py import-cookies"
 echo "2. Run a check:"
-echo "     python3 $INSTALL_DIR/worker.py check --force"
+echo "     $ENV python3 $INSTALL_DIR/worker.py check --force"
 echo "3. Share $STATE_DIR/publish with your PCs (file share or static HTTP),"
 echo "   then run client/Setup.ps1 on each PC pointing at it."

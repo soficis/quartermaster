@@ -387,7 +387,8 @@ render, then press Enter. The script writes `addon-cookies.json` to your temp
 folder. Copy that file to the feed host and import it by path:
 
 ```sh
-python3 /opt/addon-sync/reader.py import-cookies /path/to/addon-cookies.json
+# on an install.sh host, point it at the service's config and state:
+sudo ADDONSYNC_STATE_DIR=/var/lib/addon-sync ADDONSYNC_CONFIG=/etc/addon-sync.json \n  python3 /opt/addon-sync/reader.py import-cookies /path/to/addon-cookies.json
 ```
 
 Import refuses to report success until the page shows attachments. Delete the
@@ -675,9 +676,11 @@ client for the DevTools protocol. It resolves its state and config from
 (HTTP only), and `command` (run argv with `{magnet}` substituted). See
 `DEFAULTS` in `worker.py`.
 
-**One lock per run.** `fcntl` is absent on Windows, so there the scheduler does
-the serializing. `check --scheduled` bypasses the due-gate; `check_hours` only
-feeds the status display.
+**One lock per run.** `flock` on POSIX, `msvcrt.locking` on Windows; a second
+`check` or `import` while one runs exits with `"error": "busy"`. `check
+--scheduled` and `--triggered` bypass the due-gate; a plain `check` runs only
+when `check_hours` have passed since the last one (use `--force` to retry a
+failed check sooner).
 
 **Presets are data, not code.** If a task seems to need an addon name or a site
 name in Python, it probably belongs in `feeds/<name>.json`.

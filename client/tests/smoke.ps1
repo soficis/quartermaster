@@ -222,6 +222,18 @@ try {
   $r = Invoke-Sync -Cfg $cfg3
   Check ((Read-Text (Join-Path $wowP "_ptr_/Interface/AddOns/DemoAddon/.synced-version")).Trim() -eq "1.0.0") "an extra flavor installs via wow_dir"
 
+  # A manifest wow_dir is a folder name, never a path out of the root.
+  $escape = Join-Path $root "escaped"
+  New-Item -ItemType Directory -Force -Path (Join-Path $escape "Interface/AddOns") | Out-Null
+  $c4 = [ordered]@{ ManifestBase = $publish; Roots = @($wowP); Include = @("evil")
+    BackupDir = $backup2; LogPath = $logPath }
+  $cfg4 = Join-Path $root "sync4.config.json"
+  Write-Utf8 $cfg4 ($c4 | ConvertTo-Json -Depth 4)
+  New-Publish "1.0.0" -Flavor "evil" -WowDir "../escaped"
+  $r = Invoke-Sync -Cfg $cfg4
+  Check (!(Test-Path -LiteralPath (Join-Path $escape "Interface/AddOns/DemoAddon"))) "a wow_dir with a path is refused"
+  Check ($r.Output -match "not a plain folder name") "the refused wow_dir is logged"
+
   # Install detection across platforms: one parent holding three clients, a
   # direct client, a direct client whose folder name names its flavor, and a
   # missing root. Paths with spaces catch unquoted native invocations. The

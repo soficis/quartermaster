@@ -66,7 +66,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Windows PowerShell 5.1 redraws a progress bar per chunk, which makes
+# Invoke-WebRequest many times slower on a multi-MB zip.
+$ProgressPreference = "SilentlyContinue"
+$here =Split-Path -Parent $MyInvocation.MyCommand.Path
 $onWindows = !$IsLinux -and !$IsMacOS
 $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $TempDir = if ($env:TEMP) { $env:TEMP } else { [IO.Path]::GetTempPath() }
@@ -361,8 +364,18 @@ if (!$manifest -or !$manifest.flavors) {
 # carrying its client folder as wow_dir. Without this, an extra flavor would
 # be published and silently never installed.
 foreach ($p in @($manifest.flavors.PSObject.Properties)) {
+  # Both names become local paths (the install target and the backup folder),
+  # so a manifest may only use plain folder names here.
   $wowDir = "$($p.Value.wow_dir)"
-  if ($wowDir -and !$FlavorDirs.ContainsKey($wowDir) -and !($FlavorDirs.Values -contains $p.Name)) {
+  if ($p.Name -notmatch '^[A-Za-z0-9_-]+$' -or ($wowDir -and $wowDir -notmatch '^[A-Za-z0-9_]+$')) {
+    Write-Log ("ERROR: flavor {0} (wow_dir {1}) is not a plain folder name; skipped" -f $p.Name, $wowDir)
+    continue
+  }
+  if ($wowDir -and !($FlavorDirs.Values -contains $p.Name)) {
+    if ($FlavorDirs.ContainsKey($wowDir)) {
+      Write-Log ("note: flavor {0} wants {1}, which belongs to flavor {2}; skipped" -f $p.Name, $wowDir, $FlavorDirs[$wowDir])
+      continue
+    }
     $FlavorDirs[$wowDir] = $p.Name
   }
   if ($FlavorOrder -notcontains $p.Name) {
@@ -442,7 +455,9 @@ foreach ($flavor in $FlavorOrder) {
         throw "sha256 mismatch (got $hash, expected $($entry.sha256))"
       }
       New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
-      Expand-Archive -LiteralPath $tmpZip -DestinationPath $tmpDir -Force
+      # Expand-Archive skips an entry that escapes the folder with only a
+      # non-terminating error; stop instead of installing a partial addon.
+      Expand-Archive -LiteralPath $tmpZip -DestinationPath $tmpDir -Force -ErrorAction Stop
 
       $toc = Get-ChildItem -LiteralPath $tmpDir -Recurse -Filter "*.toc" |
         Where-Object { $_.BaseName -eq $entry.addon } |

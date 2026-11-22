@@ -60,6 +60,33 @@ class ExtractLinksTests(unittest.TestCase):
                          "Demo Release Retail 11.2.0.zip")
 
 
+class PlainLinkTests(unittest.TestCase):
+    def test_plain_archive_links_count_and_navigation_does_not(self):
+        html = ('<a href="https://cdn.example.com/Demo.Release.Retail.11.2.0.zip?dl=1">'
+                'get it</a> <a href="/forum/">Forum</a> '
+                '<a class="x" href="/files/notes.txt">notes</a>')
+        _m, attachments = reader.extract_links(html, BASE)
+        self.assertEqual([a["url"] for a in attachments],
+                         ["https://cdn.example.com/Demo.Release.Retail.11.2.0.zip?dl=1"])
+
+
+class ConfigFallbackTests(unittest.TestCase):
+    def test_empty_config_values_mean_unset(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump({"browser_profile": "", "browser_port": None}, fh)
+        self.addCleanup(os.remove, fh.name)
+        with mock.patch.object(reader, "CONF", fh.name):
+            self.assertEqual(reader.profile_dir(), reader.PROFILE)
+            self.assertEqual(reader.debug_port(), reader.PORT)
+
+    def test_tab_match_is_by_host_not_substring(self):
+        with mock.patch.object(reader, "thread_url",
+                               return_value="https://forum.example.com/t/1"):
+            self.assertTrue(reader.on_page_host("https://forum.example.com/x"))
+            self.assertFalse(reader.on_page_host(
+                "https://evil.test/?u=forum.example.com"))
+
+
 class DisplayNameTests(unittest.TestCase):
     def test_dn_is_decoded(self):
         self.assertEqual(
