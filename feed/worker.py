@@ -273,7 +273,9 @@ def sha256_file(path):
 
 
 def version_tuple(text):
-    return tuple(int(part) for part in re.findall(r"\d+", text or ""))
+    """Numeric parts with any letter suffix: "1.5.2a" -> ((1,""),(5,""),(2,"a"))."""
+    return tuple((int(num), suffix)
+                 for num, suffix in re.findall(r"(\d+)([a-z]*)", (text or "").lower()))
 
 
 def newer(a, b):
@@ -282,8 +284,8 @@ def newer(a, b):
         return bool(a)
     ta, tb = version_tuple(a), version_tuple(b)
     width = max(len(ta), len(tb))
-    ta += (0,) * (width - len(ta))
-    tb += (0,) * (width - len(tb))
+    ta += ((0, ""),) * (width - len(ta))
+    tb += ((0, ""),) * (width - len(tb))
     return ta > tb
 
 
@@ -582,12 +584,26 @@ def _sniff_archive(path):
                  if head.startswith(magic)), "")
 
 
-def http_download(url, cfg, dest_dir):
+def _unclaimed(name, taken):
+    """name, or name-2, name-3... so two downloads in one run never share a file."""
+    if taken is None:
+        return name
+    stem, ext = os.path.splitext(name)
+    candidate, n = name, 1
+    while candidate.lower() in taken:
+        n += 1
+        candidate = "%s-%d%s" % (stem, n, ext)
+    taken.add(candidate.lower())
+    return candidate
+
+
+def http_download(url, cfg, dest_dir, taken=None):
     """Direct download; returns the archive path, or None for a non-archive.
 
     Forum attachment links include images and other files. One saved under an
     archive name would fail extraction on every later check, so a download
-    that neither names nor looks like an archive is discarded.
+    that neither names nor looks like an archive is discarded. ``taken`` holds
+    the lower-cased names already used this run.
     """
     try:
         host = (urllib.parse.urlparse(url).hostname or "").lower()
@@ -609,6 +625,8 @@ def http_download(url, cfg, dest_dir):
         with urllib.request.urlopen(req,
                                     timeout=cfg.get("request_timeout", 40)) as r:
             name = _download_name(url, r)
+            if ARCHIVE_RE.search(name):  # otherwise named after sniffing
+                name = _unclaimed(name, taken)
             tmp = os.path.join(dest_dir, name + ".part")
             with open(tmp, "wb") as fh:
                 shutil.copyfileobj(r, fh)
@@ -618,7 +636,7 @@ def http_download(url, cfg, dest_dir):
                 os.remove(tmp)
                 log("not an archive, ignored: %s" % url[:90])
                 return None
-            name += ext
+            name = _unclaimed(name + ext, taken)
         dest = os.path.join(dest_dir, name)
         os.replace(tmp, dest)
         return dest
@@ -1000,6 +1018,7 @@ SEEN_LIMIT = 500
 def _fetch_all(feed, cfg, st, force, incoming):
     """Download what the feed lists and is new. Returns local archive paths."""
     archives = []
+    taken = set()
     for item in sorted(feed["items"], key=lambda i: ORDER.index(i["flavor"])):
         flavor, ver = item["flavor"], item["version"]
         current = st["flavors"].get(flavor, {}).get("version")
@@ -1009,7 +1028,7 @@ def _fetch_all(feed, cfg, st, force, incoming):
             if item["kind"] == "magnet":
                 archives += enqueue_magnet(item["url"], cfg)
             else:
-                archives.append(http_download(item["url"], cfg, incoming))
+                archives.append(http_download(item["url"], cfg, incoming, taken))
         except Exception as exc:
             _record_import_error(st, "%s %s" % (flavor, ver), exc,
                                  verb="download")
@@ -1026,7 +1045,7 @@ def _fetch_all(feed, cfg, st, force, incoming):
                     continue  # downloader=direct skipped it; not seen yet
                 archives += got
             else:
-                archives.append(http_download(bundle["url"], cfg, incoming))
+                archives.append(http_download(bundle["url"], cfg, incoming, taken))
         except Exception as exc:
             _record_import_error(st, bundle.get("name") or h, exc,
                                  verb="download")

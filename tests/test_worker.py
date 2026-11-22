@@ -26,8 +26,8 @@ def make_addon(base, name="DemoAddon", version="11.2.0"):
 
 class VersionTests(unittest.TestCase):
     def test_tuple_ignores_layout(self):
-        self.assertEqual(worker.version_tuple("3.4.12"), (3, 4, 12))
-        self.assertEqual(worker.version_tuple("v3-4_12"), (3, 4, 12))
+        self.assertEqual(worker.version_tuple("3.4.12"), ((3, ""), (4, ""), (12, "")))
+        self.assertEqual(worker.version_tuple("v3-4_12"), worker.version_tuple("3.4.12"))
         self.assertEqual(worker.version_tuple(""), ())
 
     def test_newer_pads_short_versions(self):
@@ -36,6 +36,12 @@ class VersionTests(unittest.TestCase):
         self.assertFalse(worker.newer("3.4", "3.4.0"))
         self.assertFalse(worker.newer("3.4.1", "3.4.1"))
         self.assertTrue(worker.newer("1.0", ""))
+
+    def test_letter_suffix_is_a_later_build(self):
+        self.assertTrue(worker.newer("1.5.2a", "1.5.2"))
+        self.assertTrue(worker.newer("1.5.2b", "1.5.2a"))
+        self.assertFalse(worker.newer("1.5.2a", "1.5.3"))
+        self.assertFalse(worker.newer("1.5.2A", "1.5.2a"))
 
 
 class ReleaseNameTests(unittest.TestCase):
@@ -424,7 +430,7 @@ class RunCheckTests(unittest.TestCase):
                 mock.patch.object(worker, "http_download",
                                   return_value=gone) as dl:
             out = worker.run_check(force=True)
-        dl.assert_called_once_with(good["url"], mock.ANY, mock.ANY)
+        dl.assert_called_once_with(good["url"], mock.ANY, mock.ANY, mock.ANY)
         self.assertFalse(out["ok"])
         self.assertIn("bad bundle", worker.state()["last_error"])
 
@@ -443,7 +449,7 @@ class RunCheckTests(unittest.TestCase):
                 mock.patch.object(worker, "http_download",
                                   return_value=gone) as dl:
             out = worker.run_check(force=True)
-        dl.assert_called_once_with(good["url"], mock.ANY, mock.ANY)
+        dl.assert_called_once_with(good["url"], mock.ANY, mock.ANY, mock.ANY)
         self.assertFalse(out["ok"])
         self.assertIn("retail 11.2.0", worker.state()["last_error"])
 
@@ -556,7 +562,8 @@ class HttpDownloadNamingTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="addonsync-dl-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
-    def _dl(self, url, headers, body=b"fake-archive-bytes", cookies=()):
+    def _dl(self, url, headers, body=b"fake-archive-bytes", cookies=(),
+            taken=None):
         from email.message import Message
         msg = Message()
         for key, value in headers.items():
@@ -582,7 +589,20 @@ class HttpDownloadNamingTests(unittest.TestCase):
                 mock.patch.object(worker.urllib.request, "urlopen",
                                   side_effect=urlopen):
             return worker.http_download(
-                url, {"thread_url": "https://forum.example.com/t/1"}, self.tmp)
+                url, {"thread_url": "https://forum.example.com/t/1"}, self.tmp,
+                taken)
+
+    def test_same_name_twice_in_one_run_keeps_both(self):
+        taken = set()
+        hdr = {"Content-Disposition": 'attachment; filename="Demo.zip"'}
+        first = self._dl("https://forum.example.com/attachments/1/", hdr,
+                         body=b"PKone", taken=taken)
+        second = self._dl("https://forum.example.com/attachments/2/", hdr,
+                          body=b"PKtwo", taken=taken)
+        self.assertNotEqual(first, second)
+        self.assertTrue(second.endswith("Demo-2.zip"))
+        with open(first, "rb") as fh:
+            self.assertEqual(fh.read(), b"PKone")
 
     def test_content_disposition_names_opaque_urls(self):
         dest = self._dl("https://forum.example.com/forum/attachments/12345/",
