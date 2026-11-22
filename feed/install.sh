@@ -41,7 +41,8 @@ echo "== worker files"
 install -o root -g root -m 0755 \
   "$REPO/feed/worker.py" "$REPO/feed/reader.py" \
   "$INSTALL_DIR/"
-python3 -m py_compile "$INSTALL_DIR/worker.py" "$INSTALL_DIR/reader.py"
+install -o root -g root -m 0644 "$REPO/feed/addonsync_common.py" "$INSTALL_DIR/"
+python3 -m py_compile "$INSTALL_DIR/worker.py" "$INSTALL_DIR/reader.py"   "$INSTALL_DIR/addonsync_common.py"
 echo "worker-ok"
 
 echo "== feed presets"

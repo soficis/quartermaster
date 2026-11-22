@@ -607,6 +607,7 @@ feeds/
 feed/
   worker.py                  page -> download -> extract -> publish + manifest
   reader.py                  Chromium reader (DevTools) + cookie import + VNC login
+  addonsync_common.py        paths, config/preset lookup and logging both share
   config.example.json        pick a preset; everything else has a default
   manual-feed.example.json   fallback links when the browser cannot read
   install.sh                 Linux service setup (packages, /opt/addon-sync, timer)

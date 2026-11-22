@@ -118,11 +118,12 @@ Write-Host "== worker, browser reader and plugin"
 $feed = Join-Path $here "..\..\feed"
 Push-File (Join-Path $feed "worker.py") "$remote/worker.py"
 Push-File (Join-Path $feed "reader.py") "$remote/reader.py"
+Push-File (Join-Path $feed "addonsync_common.py") "$remote/addonsync_common.py"
 Push-File (Join-Path $here "patch_portal_plugins.py") "$remote/patch_portal_plugins.py"
 Invoke-Pi "install -d $remote/plugins"
 Push-File (Join-Path $here "plugins\__init__.py") "$remote/plugins/__init__.py"
 Push-File (Join-Path $here "plugins\addons.py") "$remote/plugins/addons.py"
-Invoke-Pi "chmod 755 $remote/worker.py $remote/reader.py $remote/patch_portal_plugins.py; python3 -m py_compile $remote/worker.py $remote/reader.py $remote/plugins/__init__.py $remote/plugins/addons.py && echo worker-ok" | Out-Null
+Invoke-Pi "chmod 755 $remote/worker.py $remote/reader.py $remote/patch_portal_plugins.py; python3 -m py_compile $remote/worker.py $remote/reader.py $remote/addonsync_common.py $remote/plugins/__init__.py $remote/plugins/addons.py && echo worker-ok" | Out-Null
 
 Push-File (Join-Path $here "cellproxy-addons.service") "/etc/systemd/system/cellproxy-addons.service"
 Push-File (Join-Path $here "cellproxy-addons.timer") "/etc/systemd/system/cellproxy-addons.timer"

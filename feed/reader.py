@@ -40,10 +40,13 @@ import urllib.parse
 import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_DIR = (os.environ.get("ADDONSYNC_STATE_DIR") or
-             os.path.join(BASE_DIR, "state"))
-CONF = (os.environ.get("ADDONSYNC_CONFIG") or
-        os.path.join(BASE_DIR, "config.json"))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from addonsync_common import (CONF, STATE_DIR, append_log, is_unset,  # noqa: E402
+                    preset_name as _preset_name, preset_path, read_config,
+                    read_json)
+
 PROFILE = os.path.join(STATE_DIR, "browser-profile")
 PIDFILE = os.path.join(STATE_DIR, "chromium.pid")
 PORT = 9333
@@ -51,30 +54,13 @@ DISPLAY = ":99"
 DOM_TIMEOUT = 60
 LOG = os.path.join(STATE_DIR, "reader.log")
 
-# Same feed definition worker.py reads; see feeds/*.json.
-PRESET_DIRS = (os.path.join(BASE_DIR, "feeds"),
-               os.path.join(os.path.dirname(BASE_DIR), "feeds"))
-DEF_PRESET = "generic-example"
-
 
 def log(msg):
-    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
-    try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(LOG, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass
-    print(line, flush=True)
+    append_log(LOG, msg)
 
 
 def _config():
-    try:
-        with open(CONF, encoding="utf-8-sig") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return read_config(CONF)
 
 
 def cfg(key, default):
@@ -85,32 +71,19 @@ def cfg(key, default):
     """
     for source in (_config(), preset()):
         value = source.get(key)
-        if value not in (None, "", []):
+        if not is_unset(value):
             return value
     return default
 
 
 def preset_name():
-    return (os.environ.get("ADDONSYNC_PRESET")
-            or _config().get("preset") or DEF_PRESET)
+    return _preset_name(_config())
 
 
 def preset():
     """The feed definition: page URL, addon folders, release naming."""
-    name = preset_name()
-    paths = [name] if os.path.isfile(name) else [
-        os.path.join(folder, cand)
-        for folder in PRESET_DIRS
-        for cand in (name, name + ".json")]
-    for path in paths:
-        try:
-            with open(path, encoding="utf-8-sig") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict):
-            return data
-    return {}
+    data = read_json(preset_path(preset_name()) or "", {})
+    return data if isinstance(data, dict) else {}
 
 
 def thread_url():

@@ -46,14 +46,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-# All local state lives under one directory. Override it and the config path
-# with the environment when the files live elsewhere (a service install
-# points them at /var/lib/addon-sync and /etc/addon-sync.json). Defaults stay next
-# to this script so a plain checkout works with zero setup.
-STATE_DIR = (os.environ.get("ADDONSYNC_STATE_DIR") or
-             os.path.join(BASE_DIR, "state"))
-CONF = (os.environ.get("ADDONSYNC_CONFIG") or
-        os.path.join(BASE_DIR, "config.json"))
+from addonsync_common import (CONF, PRESET_DIRS, STATE_DIR, append_log,  # noqa: E402
+                    is_unset, preset_name, preset_path, read_config,
+                    read_json, write_json)
+
 STATE = os.path.join(STATE_DIR, "state.json")
 LOCK = os.path.join(STATE_DIR, "lock")
 STAGE = os.path.join(STATE_DIR, "stage")
@@ -62,56 +58,8 @@ DEF_PUBLISH = os.path.join(STATE_DIR, "publish")
 DEF_INCOMING = os.path.join(STATE_DIR, "incoming")
 
 # ---------------------------------------------------------------- feed preset
-#
-# What the feed *is* -- which page, which addon folders, how release files are
-# named -- lives in feeds/<name>.json, not here. Change the preset and the
-# same worker watches a different page for a different addon. config.json
-# picks one with "preset"; ADDONSYNC_PRESET overrides it.
 
-PRESET_DIRS = (os.path.join(BASE_DIR, "feeds"),
-               os.path.join(os.path.dirname(BASE_DIR), "feeds"))
-DEF_PRESET = "generic-example"
-
-
-def read_json(path, default):
-    # utf-8-sig so a config saved by PowerShell (BOM) still parses.
-    try:
-        with open(path, encoding="utf-8-sig") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return default
-
-
-def write_json(path, value):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp.%d" % os.getpid()
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(value, fh, indent=2, sort_keys=True)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
-
-
-def preset_path(name):
-    """Resolve a preset name or path to a file, or None."""
-    if not name:
-        return None
-    if os.path.isfile(name):
-        return os.path.abspath(name)
-    for folder in PRESET_DIRS:
-        for cand in (name, name + ".json"):
-            path = os.path.join(folder, cand)
-            if os.path.isfile(path):
-                return path
-    return None
-
-
-_RAW_CONFIG = read_json(CONF, {})
-if not isinstance(_RAW_CONFIG, dict):
-    _RAW_CONFIG = {}
-PRESET_NAME = (os.environ.get("ADDONSYNC_PRESET")
-               or _RAW_CONFIG.get("preset")
-               or DEF_PRESET)
+PRESET_NAME = preset_name(read_config(CONF))
 PRESET_FILE = preset_path(PRESET_NAME)
 if not PRESET_FILE:
     raise SystemExit("feed preset not found: %s (looked in %s)"
@@ -205,18 +153,7 @@ def manual_feed_file(cfg):
 # ---------------------------------------------------------------- utilities
 
 def log(msg):
-    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
-    try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(LOG, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass
-    print(line, flush=True)
-
-
-def _is_unset(value):
-    return value is None or value == "" or value == []
+    append_log(LOG, msg)
 
 
 def merge_settings(base, overrides):
@@ -231,11 +168,11 @@ def merge_settings(base, overrides):
     if not isinstance(overrides, dict):
         return out
     for key, value in overrides.items():
-        if _is_unset(value):
+        if is_unset(value):
             continue
         if isinstance(value, dict) and isinstance(out.get(key), dict):
             merged = dict(out[key])
-            merged.update({k: v for k, v in value.items() if not _is_unset(v)})
+            merged.update({k: v for k, v in value.items() if not is_unset(v)})
             out[key] = merged
         else:
             out[key] = value
@@ -243,7 +180,7 @@ def merge_settings(base, overrides):
 
 
 def config():
-    return merge_settings(DEFAULTS, read_json(CONF, {}))
+    return merge_settings(DEFAULTS, read_config(CONF))
 
 
 def state():
